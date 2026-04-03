@@ -40,6 +40,9 @@ struct Multicaster<'s> {
   clock: Arc<RwLock<MediaClock>>,
   channels_subscriber: Option<Arc<ChannelsSubscriber>>,
   get_peaks: PeaksCallback,
+  // Each block group has its own seqnum counter, matching the Shure MXWANI8 pattern.
+  util_block_seqnum: u16,    // for 0x8000+0x8001 packets
+  latency_block_seqnum: u16, // for 0x8003+0x8004 packets
 }
 
 impl<'s> Multicaster<'s> {
@@ -74,6 +77,8 @@ impl<'s> Multicaster<'s> {
       clock,
       channels_subscriber: None,
       get_peaks,
+      util_block_seqnum: 1,
+      latency_block_seqnum: 1,
     };
     write_str_to_buffer(&mut r.vendor, 0, 8, &self_info.vendor_string);
     return r;
@@ -172,96 +177,97 @@ impl<'s> Multicaster<'s> {
   }
 
   async fn send_heartbeat(&mut self) {
-    let ctr = self.seqnum;
-    let mut bytes = ByteBuffer::new();
-    bytes.set_endian(bytebuffer::Endian::BigEndian);
-
     let freq_offset_opt = self.get_freq_offset_ppb();
 
     if let Some(freq_offset) = freq_offset_opt {
-      bytes.write_u16(16); // length of this part
-      bytes.write_u16(0x8001); // type
-      bytes.write_u16(4); // ???
-      bytes.write_u16(4); // maybe content length???
-      bytes.write_u16(ctr);
-      bytes.write_u16(0);
-      bytes.write_i32(freq_offset);
-      trace!("freq offset {freq_offset}/1000 ppm");
+      // Packet 1: [0x8000 (utilization) + 0x8001 (clock offset)]
+      // Packet 2: [0x8003 (rx latency) + 0x8004 (missed packets)]
+      // Shure MXWANI8 sends both every second as two separate UDP datagrams.
+      // Each group has its own block seqnum counter (independent of the packet seqnum).
+      {
+        let ctr = self.util_block_seqnum;
+        let mut bytes = ByteBuffer::new();
+        bytes.set_endian(bytebuffer::Endian::BigEndian);
 
-      /* bytes.write_bytes(&[
-        0x00, 0x24, 0x80, 0x00,
-        0x00, 0x04, 0x00, 0x04, H(ctr), L(ctr), 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x10,
-        /* TX Bps, 4B: */ 0x00, 0x00, 0x01, 0xde, /* RX Bps, 4B: */ 0x00, 0x07, 0xdf, 0x17,
-        /* TX errors, 4B: */ 0x00, 0x00, 0x00, 0x02, /* RX errors, 4B: */ 0x00, 0x00, 0x00, 0x07,
-      ]); // network statistics */
-
-      let (rx_peaks, tx_peaks) = (self.get_peaks)();
-      let total_peaks = rx_peaks.len() + tx_peaks.len();
-      if total_peaks > 0 {
-        let mut total_len = 24 + total_peaks;
-        while (total_len % 4) != 0 {
-          total_len += 1;
-        }
-        let end_pos = bytes.get_wpos() + total_len;
-        bytes.write_u16((24 + total_peaks).try_into().unwrap());
-        bytes.write_u16(0x8002);
+        bytes.write_u16(36);
+        bytes.write_u16(0x8000);
         bytes.write_u16(4);
-        bytes.write_u16((12 + total_peaks).try_into().unwrap());
+        bytes.write_u16(4);
         bytes.write_u16(ctr);
         bytes.write_u16(0);
-        bytes.write_u16(tx_peaks.len().try_into().unwrap());
+        bytes.write_u16(0x0010); // constant sub-header from Shure capture
+        bytes.write_u16(0x0000);
+        bytes.write_u16(0x0001);
+        bytes.write_u16(0x0010);
+        bytes.write_u32(0); // TX bytes/sec
+        bytes.write_u32(0); // RX bytes/sec
+        bytes.write_u32(0); // TX errors
+        bytes.write_u32(0); // RX errors
+
+        bytes.write_u16(16);
+        bytes.write_u16(0x8001);
+        bytes.write_u16(4);
+        bytes.write_u16(4);
+        bytes.write_u16(ctr);
         bytes.write_u16(0);
-        bytes.write_u16(rx_peaks.len().try_into().unwrap());
-        bytes.write_u16(0);
-        bytes.write_u16(24);
-        bytes.write_u16(0);
-        for peak in tx_peaks.into_iter().chain(rx_peaks.into_iter()) {
-          bytes.write_u8(peak);
-        }
-        while bytes.get_wpos() < end_pos {
-          bytes.write_u8(0);
-        }
+        bytes.write_i32(freq_offset);
+
+        self.util_block_seqnum = self.util_block_seqnum.wrapping_add(1);
+        let content = bytes.as_bytes().to_vec();
+        self.send(self.heartbeat_destination, 0xfffe, [0, 8, 0, 1, 0x10, 0, 0, 0], &content).await;
       }
 
-      // rx latency:
       if let Some(chsub) = self.channels_subscriber.as_ref() {
-        let flows_info = chsub.flows_info();
-        let flows_info = flows_info.read().unwrap();
-        let flows_count = flows_info.len() as u16;
-        bytes.write_u16(24 + flows_count * 4);
-        bytes.write_u16(0x8003);
-        bytes.write_u16(4);
-        bytes.write_u16(12 + flows_count * 4); // content length
-        bytes.write_u16(ctr);
-        bytes.write_u16(0);
-        bytes.write_u16(flows_count); // number of flows
-        bytes.write_u16(0);
-        bytes.write_u16(24);
-        bytes.write_u16(0);
-        bytes.write_u32(self.self_info.sample_rate);
+        let ctr = self.latency_block_seqnum;
 
-        for opt in flows_info.iter() {
-          let latency =
-            opt.as_ref().map(|fi| fi.actual_latency_samples.swap(0, Ordering::Relaxed)).unwrap_or(0);
-          bytes.write_u32(latency.clamp(0, i32::MAX) as u32);
-        }
+        let content = {
+          let mut bytes = ByteBuffer::new();
+          bytes.set_endian(bytebuffer::Endian::BigEndian);
+
+          let flows_info = chsub.flows_info();
+          let flows_info = flows_info.read().unwrap();
+          let flows_count = flows_info.len() as u16;
+
+          bytes.write_u16(24 + flows_count * 4);
+          bytes.write_u16(0x8003);
+          bytes.write_u16(4);
+          bytes.write_u16(12 + flows_count * 4);
+          bytes.write_u16(ctr);
+          bytes.write_u16(0);
+          bytes.write_u16(flows_count);
+          bytes.write_u16(0);
+          bytes.write_u16(24);
+          bytes.write_u16(0);
+          bytes.write_u32(self.self_info.sample_rate);
+          for opt in flows_info.iter() {
+            let latency =
+              opt.as_ref().map(|fi| fi.actual_latency_samples.swap(0, Ordering::Relaxed)).unwrap_or(0);
+            bytes.write_u32(latency.clamp(0, i32::MAX) as u32);
+          }
+
+          bytes.write_u16(20 + flows_count * 4);
+          bytes.write_u16(0x8004);
+          bytes.write_u16(4);
+          bytes.write_u16(8 + flows_count * 4);
+          bytes.write_u16(ctr);
+          bytes.write_u16(0);
+          bytes.write_u16(flows_count);
+          bytes.write_u16(0);
+          bytes.write_u16(20);
+          bytes.write_u16(0);
+          for _ in 0..flows_count {
+            bytes.write_u32(0);
+          }
+          // lock guard dropped here, before the await
+          bytes.as_bytes().to_vec()
+        };
+
+        self.latency_block_seqnum = self.latency_block_seqnum.wrapping_add(1);
+        self.send(self.heartbeat_destination, 0xfffe, [0, 8, 0, 1, 0x10, 0, 0, 0], &content).await;
       }
-
-      /* bytes.write_bytes(&[
-        0x00, 0x1c, 0x80, 0x04,
-        0x00, 0x04, 0x00, 0x10,  H(ctr), L(ctr), 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-      ]); */
-      /*
-      0x00, 0x1c, 0x80, 0x04, 0x00, 0x04, 0x00, 0x10, 0x17, 0x0f, 0x00, 0x00,
-      0x00, 0x02, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, missed packets, 4B: 0x00, 0x03, 0x90, 0x1e, 0x00, 0x00, 0x00, 0x00
-       */
     } else {
       debug!("no clock available");
     }
-
-    let content = bytes.as_bytes();
-    self.send(self.heartbeat_destination, 0xfffe, [0, 8, 0, 1, 0x10, 0, 0, 0], &content).await;
 
     // this is probably response to 0738008100000064
     /* self.send(
