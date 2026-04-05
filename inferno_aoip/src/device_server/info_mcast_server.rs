@@ -135,11 +135,15 @@ impl<'s> Multicaster<'s> {
     // 0x16:
     //       0x10 - has Manufacturer name
     //       0x40 - Network is configurable (supports static addressing)
-    // 0x17: Identify device, Sample rate & encoding configuration, Reboot, Factory reset (was 0xdb)
+    // 0x17: feature flags:
+    //   0x08 = Identify device (LED blink)
+    //   0x10 = Sample rate & encoding (enables DC to query/display these values)
+    //   0x40 = Reboot (omitted — not implemented)
+    //   0x80 = Factory reset (omitted — not implemented)
     content[0x14] = 0;
     content[0x15] = 0;
     content[0x16] = 0x10;
-    content[0x17] = 0;
+    content[0x17] = 0x18; // Identify + Sample rate & encoding display
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
                           /* content[0xbf] = 5;
