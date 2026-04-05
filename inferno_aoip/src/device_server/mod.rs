@@ -15,7 +15,7 @@ use tx_multicasts::TransmitMulticasts;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 
 use std::time::{Duration, Instant};
@@ -77,6 +77,10 @@ pub struct DeviceServer {
   shutdown_todo: Pin<Box<dyn Future<Output = ()> + Send>>,
   tx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
   rx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+  pub tx_bytes: Arc<AtomicU64>,
+  pub rx_bytes: Arc<AtomicU64>,
+  pub tx_errors: Arc<AtomicU32>,
+  pub rx_errors: Arc<AtomicU32>,
 }
 
 impl DeviceServer {
@@ -118,6 +122,10 @@ impl DeviceServer {
     let rxps = rx_peaks_supplier.clone();
     let flows_tx: Arc<Mutex<Option<FlowsTransmitter>>> = Default::default();
     let tx_multicasts: Arc<Mutex<Option<TransmitMulticasts>>> = Default::default();
+    let tx_bytes: Arc<AtomicU64> = Arc::new(0.into());
+    let rx_bytes: Arc<AtomicU64> = Arc::new(0.into());
+    let tx_errors: Arc<AtomicU32> = Arc::new(0.into());
+    let rx_errors: Arc<AtomicU32> = Arc::new(0.into());
     tasks.append(&mut vec![
       tokio::spawn(arc_server::run_server(
         self_info.clone(),
@@ -137,6 +145,10 @@ impl DeviceServer {
         channels_sub_rx,
         Box::new(move || ((rxps.read().unwrap())(), (txps.read().unwrap())())),
         shdn_recv3,
+        tx_bytes.clone(),
+        rx_bytes.clone(),
+        tx_errors.clone(),
+        rx_errors.clone(),
       )),
     ]);
 
@@ -168,11 +180,13 @@ impl DeviceServer {
       tx_multicasts_by_channel,
       rx_peaks_supplier,
       tx_peaks_supplier,
-      //tasks,
-      //tx_inputs,
       shutdown_todo,
       rx_shutdown_todo: None,
       tx_shutdown_todo: None,
+      tx_bytes,
+      rx_bytes,
+      tx_errors,
+      rx_errors,
     }
   }
 
@@ -237,6 +251,8 @@ impl DeviceServer {
       srx1,
       current_timestamp,
       on_transfer,
+      self.rx_bytes.clone(),
+      self.rx_errors.clone(),
     );
     let flows_rx_handle = Arc::new(flows_rx_handle);
     let (channels_sub_handle, channels_sub_worker) = ChannelsSubscriber::new(
@@ -303,6 +319,8 @@ impl DeviceServer {
       start_time_rx,
       current_timestamp.clone(),
       on_transfer,
+      self.tx_bytes.clone(),
+      self.tx_errors.clone(),
     );
     *self.flows_tx.lock().await = Some(flows_tx_handle);
     let txm = TransmitMulticasts::new(

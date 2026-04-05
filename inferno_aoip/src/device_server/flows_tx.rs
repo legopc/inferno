@@ -3,7 +3,7 @@ use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
-use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::AtomicU32, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::{AtomicU32, AtomicU64}, time::Duration};
 
 use atomic::Ordering;
 use futures::FutureExt;
@@ -103,6 +103,8 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   timestamp_shift: ClockDiff,
   current_timestamp: Arc<AtomicUsize>,
   on_transfer: Option<TransferNotifier>,
+  tx_bytes: Arc<AtomicU64>,
+  tx_errors: Arc<AtomicU32>,
   //callback: SamplesRequestCallback,
 }
 
@@ -179,11 +181,14 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         if let Ok(written) = flow.socket.send(&pbuff[0..to_send]) {
           if written == to_send {
             flow.next_ts = flow.next_ts.wrapping_add(flow.fpp.try_into().unwrap());
+            self.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
           } else {
             warn!("written {written}, should have {to_send}");
+            self.tx_errors.fetch_add(1, Ordering::Relaxed);
           }
         } else {
           warn!("send returned error");
+          self.tx_errors.fetch_add(1, Ordering::Relaxed);
         }
         iterations += 1;
         if (iterations % 16) == 0 {
@@ -437,6 +442,8 @@ pub struct FlowsTransmitter {
   ip_port_to_id: BTreeMap<SocketAddr, u32>,
   commands_sender: mpsc::Sender<Command>,
   flows_info: Vec<Option<FlowInfo>>,
+  pub tx_bytes: Arc<AtomicU64>,
+  pub tx_errors: Arc<AtomicU32>,
 }
 
 fn split_handle(h: FlowHandle) -> (u32, u16) {
@@ -454,6 +461,8 @@ impl FlowsTransmitter {
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
+    tx_bytes: Arc<AtomicU64>,
+    tx_errors: Arc<AtomicU32>,
   ) {
     let latency: u32 = (latency_ns as u64 * sample_rate as u64 / 1_000_000_000u64).try_into().unwrap();
     let mut internal = FlowsTransmitterInternal {
@@ -471,6 +480,8 @@ impl FlowsTransmitter {
         .unwrap(),
       current_timestamp,
       on_transfer,
+      tx_bytes,
+      tx_errors,
     };
     internal.run(start_time_rx).await;
   }
@@ -482,25 +493,32 @@ impl FlowsTransmitter {
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
+    tx_bytes: Arc<AtomicU64>,
+    tx_errors: Arc<AtomicU32>,
   ) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
-    let tx1 = tx.clone();
     let srate = self_info.sample_rate;
     // TODO dehardcode latency_ns
-    let thread_join = run_future_in_new_thread("flows TX", move || {
-      Self::run(
-        rx,
-        clock_recv,
-        srate,
-        0, /*LATENCY TODO*/
-        // we set max_lag_samples to tx latency because it doesn't make sense to send samples older than that
-        (tx_latency_ns as u64 * srate as u64 / 1_000_000_000u64).try_into().unwrap(),
-        channels_outputs,
-        start_time_rx,
-        current_timestamp,
-        on_transfer,
-      )
-      .boxed_local()
+    let thread_join = run_future_in_new_thread("flows TX", {
+      let tx_bytes = tx_bytes.clone();
+      let tx_errors = tx_errors.clone();
+      move || {
+        Self::run(
+          rx,
+          clock_recv,
+          srate,
+          0, /*LATENCY TODO*/
+          // we set max_lag_samples to tx latency because it doesn't make sense to send samples older than that
+          (tx_latency_ns as u64 * srate as u64 / 1_000_000_000u64).try_into().unwrap(),
+          channels_outputs,
+          start_time_rx,
+          current_timestamp,
+          on_transfer,
+          tx_bytes,
+          tx_errors,
+        )
+        .boxed_local()
+      }
     });
     return (
       Self {
@@ -510,6 +528,8 @@ impl FlowsTransmitter {
         flows: BTreeMap::new(),
         ip_port_to_id: BTreeMap::new(),
         flows_info: (0..MAX_FLOWS).map(|_| None).collect_vec(),
+        tx_bytes,
+        tx_errors,
       },
       thread_join,
     );

@@ -6,7 +6,7 @@ use crate::protocol::mcast::{make_packet, MulticastMessage};
 use crate::media_clock::MediaClock;
 use crate::{byte_utils::write_str_to_buffer, device_info::DeviceInfo};
 use bytebuffer::ByteBuffer;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::{
   net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -43,6 +43,10 @@ struct Multicaster<'s> {
   // Each block group has its own seqnum counter, matching the Shure MXWANI8 pattern.
   util_block_seqnum: u16,    // for 0x8000+0x8001 packets
   latency_block_seqnum: u16, // for 0x8003+0x8004 packets
+  tx_bytes: Arc<AtomicU64>,
+  rx_bytes: Arc<AtomicU64>,
+  tx_errors: Arc<AtomicU32>,
+  rx_errors: Arc<AtomicU32>,
 }
 
 impl<'s> Multicaster<'s> {
@@ -51,6 +55,10 @@ impl<'s> Multicaster<'s> {
     server: UdpSocketWrapper,
     clock: Arc<RwLock<MediaClock>>,
     get_peaks: PeaksCallback,
+    tx_bytes: Arc<AtomicU64>,
+    rx_bytes: Arc<AtomicU64>,
+    tx_errors: Arc<AtomicU32>,
+    rx_errors: Arc<AtomicU32>,
   ) -> Multicaster {
     let patch_version = env!("CARGO_PKG_VERSION_PATCH").parse::<u16>().unwrap();
     let mut r = Multicaster {
@@ -79,6 +87,10 @@ impl<'s> Multicaster<'s> {
       get_peaks,
       util_block_seqnum: 1,
       latency_block_seqnum: 1,
+      tx_bytes,
+      rx_bytes,
+      tx_errors,
+      rx_errors,
     };
     write_str_to_buffer(&mut r.vendor, 0, 8, &self_info.vendor_string);
     return r;
@@ -199,10 +211,10 @@ impl<'s> Multicaster<'s> {
         bytes.write_u16(0x0000);
         bytes.write_u16(0x0001);
         bytes.write_u16(0x0010);
-        bytes.write_u32(0); // TX bytes/sec
-        bytes.write_u32(0); // RX bytes/sec
-        bytes.write_u32(0); // TX errors
-        bytes.write_u32(0); // RX errors
+        bytes.write_u32(self.tx_bytes.swap(0, Ordering::Relaxed).min(u32::MAX as u64) as u32); // TX bytes/sec
+        bytes.write_u32(self.rx_bytes.swap(0, Ordering::Relaxed).min(u32::MAX as u64) as u32); // RX bytes/sec
+        bytes.write_u32(self.tx_errors.swap(0, Ordering::Relaxed)); // TX errors
+        bytes.write_u32(self.rx_errors.swap(0, Ordering::Relaxed)); // RX errors
 
         bytes.write_u16(16);
         bytes.write_u16(0x8001);
@@ -255,8 +267,12 @@ impl<'s> Multicaster<'s> {
           bytes.write_u16(0);
           bytes.write_u16(20);
           bytes.write_u16(0);
-          for _ in 0..flows_count {
-            bytes.write_u32(0);
+          for opt in flows_info.iter() {
+            let missed = opt
+              .as_ref()
+              .map(|fi| fi.missed_packets.swap(0, Ordering::Relaxed))
+              .unwrap_or(0);
+            bytes.write_u32(missed);
           }
           // lock guard dropped here, before the await
           bytes.as_bytes().to_vec()
@@ -374,6 +390,46 @@ impl<'s> Multicaster<'s> {
       )
       .await;
   }
+
+  async fn send_sample_rate(&mut self) {
+    self
+      .send(
+        self.device_info_destination,
+        0xffff,
+        [0x07, 0x2a, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[
+          0x00, 0x18, 0x00, 0x04,
+          0x00, 0x00, 0xbb, 0x80, // current sample rate: 48000
+          0x00, 0x00, 0xbb, 0x80,
+          0x00, 0x02, 0x00, 0x00, // 2 supported rates listed
+          0x00, 0x00,
+          0xac, 0x44,             // 44100
+          0x00, 0x00, 0xbb, 0x80, // 48000
+          0x00, 0x01, 0x58, 0x88, // 88200
+          0x00, 0x01, 0x77, 0x00, // 96000
+        ],
+      )
+      .await;
+  }
+
+  async fn send_encoding(&mut self) {
+    self
+      .send(
+        self.device_info_destination,
+        0xffff,
+        [0x07, 0x2a, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00],
+        &[
+          0x00, 0x18, 0x00, 0x03,
+          0x00, 0x00, 0x00, 0x18, // current encoding: 24-bit (0x18)
+          0x00, 0x00, 0x00, 0x18,
+          0x00, 0x02, 0x00, 0x00, // 2 supported encodings
+          0x00, 0x00, 0x00, 0x18, // 24-bit
+          0x00, 0x00, 0x00, 0x10, // 16-bit
+          0x00, 0x00, 0x00, 0x20, // 32-bit
+        ],
+      )
+      .await;
+  }
 }
 
 pub async fn run_server(
@@ -383,11 +439,15 @@ pub async fn run_server(
   mut channels_sub_rx: watch::Receiver<Option<Arc<ChannelsSubscriber>>>,
   get_peaks: PeaksCallback,
   shutdown: BroadcastReceiver<()>,
+  tx_bytes: Arc<AtomicU64>,
+  rx_bytes: Arc<AtomicU64>,
+  tx_errors: Arc<AtomicU32>,
+  rx_errors: Arc<AtomicU32>,
 ) {
   let server =
     UdpSocketWrapper::new(Some(self_info.ip_address), self_info.info_request_port, shutdown).await;
   let mut recv_buff = crate::net_utils::ReceiveBuffer::new();
-  let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks);
+  let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks, tx_bytes, rx_bytes, tx_errors, rx_errors);
   mcaster.send_board_info().await;
   mcaster.send_product_info().await;
   let mut heartbeat_interval = interval(Duration::from_secs(1));
@@ -422,6 +482,12 @@ pub async fn run_server(
               mcaster.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x78, 0, 0, 0, 0],
               &[0, 0, 0, 3, 0, 0, 0, 0]
             ).await;
+          }
+          [0x07, _, 0, 0x81, 0, 0, 0, _] => {
+            mcaster.send_sample_rate().await;
+          }
+          [0x07, _, 0, 0x83, 0, 0, 0, _] => {
+            mcaster.send_encoding().await;
           }
           _ => {
             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));

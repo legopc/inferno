@@ -9,7 +9,7 @@ use crate::{common::*, media_clock::MediaClock};
 
 use std::io::ErrorKind::WouldBlock;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI32, AtomicUsize};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -49,6 +49,7 @@ struct SocketData<P: ProxyToSamplesBuffer> {
   channels: Vec<Option<Channel<P>>>,
   empty_sinks_vecs: Vec<Vec<RBInput<Sample, P>>>,
   actual_latency_samples: Arc<AtomicI32>,
+  missed_packets: Arc<AtomicU32>,
 }
 
 struct SilenceWriter<P: ProxyToSamplesBuffer> {
@@ -89,6 +90,8 @@ struct FlowsReceiverInternal<P: ProxyToSamplesBuffer> {
   ref_instant: Instant,
   on_transfer: Option<TransferNotifier>,
   current_timestamp: Arc<AtomicUsize>,
+  rx_bytes: Arc<AtomicU64>,
+  rx_errors: Arc<AtomicU32>,
 }
 
 impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
@@ -99,6 +102,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
     clock: &mut MediaClock,
     ref_instant: Instant,
     write: bool,
+    rx_bytes: &Arc<AtomicU64>,
+    rx_errors: &Arc<AtomicU32>,
   ) -> Command<P> {
     let mut buf = [0; MTU];
     loop {
@@ -106,8 +111,10 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
         Ok((recv_size, src)) => {
           if recv_size < 9 {
             error!("received corrupted (too small) packet on flow socket");
+            rx_errors.fetch_add(1, Ordering::Relaxed);
             return Command::NoOp;
           }
+          rx_bytes.fetch_add(recv_size as u64, Ordering::Relaxed);
           let timestamp = (u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize)
             .wrapping_mul(sample_rate as usize)
             .wrapping_add(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize)
@@ -121,6 +128,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           if let Some(now) = clock.wrapping_now_in_timebase(sample_rate.into()) {
             let latency = wrapped_diff(now, timestamp).clamp(0, i32::MAX as _);
             sd.actual_latency_samples.fetch_max(latency as _, Ordering::Relaxed);
+            if latency > sd.latency_samples as isize {
+              sd.missed_packets.fetch_add(1, Ordering::Relaxed);
+            }
           }
 
           if write {
@@ -254,6 +264,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
               &mut self.clock,
               self.ref_instant,
               start_time_rx.is_none(),
+              &self.rx_bytes,
+              &self.rx_errors,
             );
           } else {
             warn!("got token not bound to any existing socket");
@@ -449,6 +461,7 @@ pub struct FlowInfo {
   pub channels_map: Vec<BoolVec>,
   pub latency_samples: u32,
   pub actual_latency_samples: Arc<AtomicI32>,
+  pub missed_packets: Arc<AtomicU32>,
 }
 
 pub struct FlowsReceiver<P: ProxyToSamplesBuffer> {
@@ -456,6 +469,8 @@ pub struct FlowsReceiver<P: ProxyToSamplesBuffer> {
   waker: mio::Waker,
   max_channels: usize,
   pub flows_info: Arc<RwLock<Vec<Option<FlowInfo>>>>,
+  pub rx_bytes: Arc<AtomicU64>,
+  pub rx_errors: Arc<AtomicU32>,
 }
 
 impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
@@ -469,6 +484,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
     on_transfer: Option<TransferNotifier>,
     current_timestamp: Arc<AtomicUsize>,
     max_channels: usize,
+    rx_bytes: Arc<AtomicU64>,
+    rx_errors: Arc<AtomicU32>,
   ) {
     let mut internal = FlowsReceiverInternal {
       commands_receiver: rx,
@@ -481,6 +498,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       ref_instant,
       on_transfer,
       current_timestamp,
+      rx_bytes,
+      rx_errors,
     };
     internal.run(start_time_rx);
   }
@@ -491,6 +510,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
+    rx_bytes: Arc<AtomicU64>,
+    rx_errors: Arc<AtomicU32>,
   ) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
     let poll = mio::Poll::new().unwrap();
@@ -499,18 +520,24 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
     let max_channels = self_info.rx_channels.len();
     let thread_join = std::thread::Builder::new()
       .name("flows RX".to_owned())
-      .spawn(move || {
-        Self::run(
-          rx,
-          poll,
-          srate,
-          ref_instant,
-          clock_recv,
-          start_time_rx,
-          on_transfer,
-          current_timestamp,
-          max_channels,
-        );
+      .spawn({
+        let rx_bytes = rx_bytes.clone();
+        let rx_errors = rx_errors.clone();
+        move || {
+          Self::run(
+            rx,
+            poll,
+            srate,
+            ref_instant,
+            clock_recv,
+            start_time_rx,
+            on_transfer,
+            current_timestamp,
+            max_channels,
+            rx_bytes,
+            rx_errors,
+          );
+        }
       })
       .unwrap();
     return (
@@ -519,6 +546,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
         waker,
         max_channels,
         flows_info: Arc::new(RwLock::new((0..MAX_FLOWS).map(|_| None).collect_vec())),
+        rx_bytes,
+        rx_errors,
       },
       thread_join,
     );
@@ -548,11 +577,13 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       .collect_vec();
     let port = socket.local_addr().unwrap().port();
     let als: Arc<AtomicI32> = Arc::new(0.into());
+    let mp: Arc<AtomicU32> = Arc::new(0.into());
     self.flows_info.write().unwrap()[local_index] = Some(FlowInfo {
       rx_port: port,
       channels_map: (0..channels_count).map(|_| boolvec![false; self.max_channels]).collect(),
       latency_samples: latency_samples.try_into().unwrap(),
       actual_latency_samples: als.clone(),
+      missed_packets: mp.clone(),
     });
     self
       .commands_sender
@@ -568,6 +599,7 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
           channels: (0..channels_count).map(|_| None).collect(),
           empty_sinks_vecs,
           actual_latency_samples: als,
+          missed_packets: mp,
         },
       })
       .await
