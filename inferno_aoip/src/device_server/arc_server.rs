@@ -124,7 +124,7 @@ pub async fn run_server(
           paginate_respond(
             &mut conn,
             request.content(),
-            if subscriber.is_some() { self_info.rx_channels.len().min(32).try_into().unwrap() } else { 0 },
+            self_info.rx_channels.len().min(32).try_into().unwrap(),
             self_info.rx_channels.iter().enumerate(),
             |(channel_index, ch), bytes| {
               if common_descriptor_offset == 0 {
@@ -132,7 +132,7 @@ pub async fn run_server(
                 common_descriptor_offset = bytes.get_wpos().try_into().unwrap();
                 bytes.write_bytes(descr.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice());
               }
-              let status = subscriber.as_ref().unwrap().channel_status(channel_index);
+              let status = subscriber.as_ref().and_then(|s| s.channel_status(channel_index));
               let (tx_channel_name_offset, tx_hostname_offset) = match &status {
                 None => (0, 0),
                 Some(status) => (
