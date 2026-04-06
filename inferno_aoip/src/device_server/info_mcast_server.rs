@@ -143,12 +143,12 @@ impl<'s> Multicaster<'s> {
     // 0x17: feature flags:
     //   0x08 = Identify device (LED blink)
     //   0x10 = Sample rate & encoding (enables DC to query/display these values)
-    //   0x40 = Reboot (omitted — not implemented)
-    //   0x80 = Factory reset (omitted — not implemented)
+    //   0x40 = Reboot (enables the Reboot button in DC Device Config panel)
+    //   0x80 = Factory reset (intentionally omitted — we don't implement factory reset)
     content[0x14] = 0;
     content[0x15] = 0;
     content[0x16] = 0x10;
-    content[0x17] = 0x08; // Identify only — bit 0x10 would make DC show rate/encoding as editable
+    content[0x17] = 0x08 | 0x40; // Identify + Reboot; 0x80 (factory reset) intentionally excluded
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
     content[0xbf] = 5;   // T1.6: limit DC polling rate for board-info sub-types (matches reference capture)
