@@ -22,6 +22,19 @@ over speculation in this document.
 | Unicast | 4455 | Dante Audio | CMC protocol |
 | Unicast | varies | Audio | RTP audio flows |
 
+**Inferno ALT_PORT offsets** (inferno uses alternate ports — standard Dante ports are also listened on):
+
+| ALT_PORT offset | Port (base 6000) | Purpose |
+|-----------------|------------------|---------|
+| +4 | 6004 | ARC server (alt) |
+| +5 | 6005 | CMC server (alt) |
+| +6 | 6006 | Device info multicast send |
+| +7 | 6007 | Info request port (unicast — receives reboot/identify conmon) |
+| +8 | 6008 | Heartbeat multicast send |
+| +9 | 6009 | (reserved) |
+| +10 | 6010 | Audio RTP (alt base) |
+| +11 | 6011 | Info request port 2 |
+
 ---
 
 ## Packet Outer Structure
@@ -231,14 +244,14 @@ Sent to 224.0.0.231:8702. Content is 200 bytes. Key offsets:
 0x16        Feature flags byte 3  — Shure: 0xd4 (0x10=Manufacturer name, 0x40=static IP + others)
             Inferno sets: 0x10 (Manufacturer name only)
 0x17        Feature flags byte 4  — Shure: 0xcb = 0b11001011
-            Inferno sets: 0x08 (Identify only)
+            Inferno sets: 0x4b = 0b01001011 (Identify + Reboot + companion bits 0x01|0x02)
             Known bits:
-              0x01: unknown (set in Shure)
-              0x02: unknown (set in Shure)
-              0x08: Identify button (LED blink) — safe to set
-              0x10: ⚠️ Allow DC to CHANGE sample rate — makes rate editable, do NOT set
-              0x40: Reboot (set in Shure) — not implemented
-              0x80: Factory reset (set in Shure) — not implemented
+              0x01: companion bit — required alongside 0x40 (Reboot) for DC to activate button
+              0x02: companion bit — required alongside 0x40 (Reboot) for DC to activate button
+              0x08: Identify button (LED blink) — set; 0x0BC8 handler TODO (T3.10)
+              0x10: ⚠️ Allow DC to CHANGE sample rate — makes rate editable, do NOT set (T3.13)
+              0x40: Reboot — ✅ set and implemented (conmon 0x0090, ack 0x0092, then exit(0))
+              0x80: Factory reset — intentionally NOT set; DC greys the button regardless
 0x38..0x47  Board name again (16 chars)
 0xbb        0x1f — critical: if 0, device is flooded with 1/s info multicast requests
 ```
@@ -304,6 +317,27 @@ Each datagram group uses an independent seqnum counter (`util_block_seqnum` and
 
 0x8002 (audio peaks) was removed from heartbeats — the Shure never sends it in
 multicast heartbeats.
+
+---
+
+## Community-Sourced Conmon Opcode Reference
+
+Opcodes sourced from `chris-ritsen/network-audio-controller` packet dissector. Not all are implemented in inferno.
+
+| Opcode | Name | Inferno status |
+|--------|------|----------------|
+| `0x0077` | clear_config | Received — no-op handler (T3.9 pending) |
+| `0x0081` | set_sample_rate | Not handled (T3.13 — blocked, see scaffold) |
+| `0x0090` | reboot | ✅ Implemented (exit(0) + ack 0x0092) |
+| `0x0092` | reboot_ack | Sent as reboot response |
+| `0x01FE` | metering_data | Not handled |
+| `0x0326` | set_output_gain | Not handled (T3.12 — blocked, see scaffold) |
+| `0x0344` | set_input_gain | Not handled (T3.12 — blocked, see scaffold) |
+| `0x03D7` | set_encoding | Not handled |
+| `0x0BC8` | identify | Not handled (T3.10 — low complexity) |
+| `0x1008` | heartbeat_query | ✅ Handled — logged at trace level (no response needed) |
+| `0x22DC` | set_aes67 | Not handled |
+| `0x40FE` | metering_data_extended | Not handled |
 
 ---
 

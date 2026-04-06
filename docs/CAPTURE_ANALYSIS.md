@@ -155,7 +155,7 @@ shows it blank. Behaviour matches Shure exactly. No further action needed.
   - 0x8000 TX/RX utilization with real counters
   - 0x80 sample rate header fixed to `00 18 00 01`
   - 0x82 encoding header `00 18 00 03` (non-editable)
-  - `content[0x17] = 0x08` (remove bit 0x10 = rate configurable)
+  - `content[0x17] = 0x4b` (Identify `0x08` + Reboot `0x40` + companion bits `0x01|0x02`)
 
 - `inferno/inferno_aoip/src/device_server/arc_server.rs`
   - Always returns `rx_channels.len()` regardless of subscriber state (routing tab fix)

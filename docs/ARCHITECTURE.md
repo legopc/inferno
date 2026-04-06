@@ -5,7 +5,8 @@
 Inferno is a Dante-compatible AoIP device implemented in Rust. It presents as an ALSA PCM device
 to applications on Linux and transmits/receives audio over the Dante network protocol.
 
-**Repository**: https://gitlab.com/lumifaza/inferno  
+**Repository (upstream)**: https://gitlab.com/lumifaza/inferno  
+**Repository (fork)**: https://github.com/legopc/inferno (DC integration work, `dev` branch)  
 **Rust edition**: 2021, workspace with 3 crates
 
 ---
@@ -172,11 +173,11 @@ The ALSA plugin reads these parameters from the `~/.asoundrc` PCM definition:
 |----------|-------------------|------------|
 | Latency → Setting | ✅ Shows (e.g. 10ms) | Comes from Dante subscription negotiation |
 | Latency → Peak | ✅ Shows | `0x8003` heartbeat block, measured per packet |
-| Latency → Average | ❌ Blank | Not tracked — only peak (max) is measured |
-| Latency → Late | ❌ Blank | Not tracked — T2.2 pending |
+| Latency → Average | ✅ Shows | `0x8004` heartbeat block — running average tracked (T2.2 done) |
+| Latency → Late | ✅ Shows | `0x8004` heartbeat block — late-packet counter tracked (T2.2 done) |
 | TX/RX Util | ✅ Shows | `0x8000` heartbeat block, real byte counters |
 | Sample Rate | ✅ Shows (read-only) | `0x80` device info, configured rate |
-| Encoding | ✅ Acceptable (blank) | Matches Shure behaviour; bit depth advertised but DC doesn't show it |
+| Encoding | ✅ (blank, matches Shure) | Bit depth advertised in `0x82` device info; DC displays blank — correct |
 | Audio Levels | ✅ Sends (0x8002) | `get_peaks` called per heartbeat — TX+RX peaks per channel, 0–255 log-scale |
 | Clock offset | ✅ Shows | `0x8001` is fully implemented |
 | Routing tab | ✅ Shows RX channels | `arc_server` always returns rx_channels |
@@ -200,3 +201,20 @@ cargo check
 ```
 
 Requires: `rustup` with Rust 1.94.0, `libasound2-dev` (or `alsa-lib-devel`).
+
+### Build Reproducibility
+
+A source-neutral change (docs, patches, no Rust code) produces an identical `.so` binary.
+Verify with a hash-check workflow:
+
+```bash
+# Before any merge that might affect Rust source:
+sha256sum ~/.local/lib/alsa-lib/libasound_module_pcm_inferno.so
+
+# After rebuild on dante-doos:
+cd ~/inferno && cargo build --release
+sha256sum target/release/libasound_module_pcm_inferno.so
+
+# Identical hashes = safe to deploy, no behaviour change
+# Different hashes = Rust source changed — review diff before deploying
+```

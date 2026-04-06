@@ -17,7 +17,7 @@ This document covers what comes next, ordered by effort and impact.
 | Routing tab visibility | ✅ Fixed — always return rx_channels regardless of subscriber |
 | Sample rate in DC | ✅ Fixed — read-only display, uses actual configured rate |
 | Encoding in DC | ✅ Acceptable (blank, matches Shure behaviour) |
-| GitHub repo | ✅ `legopc/inferno-dc-stats` (private) |
+| GitHub repo | ✅ `legopc/inferno` (consolidated; `inferno-dc-stats` archived) |
 | T1.1: statime release build | ✅ Done (Apr 2026) — `target/release/statime`, loglevel=info |
 | T1.2: SCHED_FIFO for statime | ✅ Done (Apr 2026) — `CPUSchedulingPolicy=fifo`, priority 80 |
 | T1.3: sample_rate from DeviceInfo | ✅ Done (Apr 2026) — `send_sample_rate()` uses `self_info.sample_rate` |
@@ -32,7 +32,7 @@ This document covers what comes next, ordered by effort and impact.
 | ARC 0x2204 stub | ✅ Done (Apr 2026) — DC polls this at ~500 req/s; now returns CODE_OK silently |
 | T3.4: Reboot via DC | ✅ Done (Apr 2026) — conmon 0x073d/0x0090 on info_request_port; ack 0x0092 then exit |
 | Reboot button in DC | ✅ Done (Apr 2026) — CMC response start code fixed to 0x1200; added CMC 0x3010 controller-registration echo handler; factory reset greyed naturally by DC, handler is defensive no-op |
-| Switch Config / Addresses in DC | ⚠️ Now ungreyed (side-effect of CMC 0x3010 fix) — clicking these tabs likely fails silently; needs investigation (see T3.7, T3.8) |
+| Switch Config / Addresses in DC | ✅ Greyed (`0x16` bit `0x40` NOT set) — Switch Config shows "Retrieving information…" spinner; Addresses has no spinner. Investigated T3.7/T3.8. |
 | Clear Config in DC | ⚠️ Clickable (board_info 0x15 doesn't fully grey it). Handler is a no-op. Planned: T3.9 — exit(0) + systemd restart |
 
 ---
@@ -316,22 +316,16 @@ The counters already exist as `Arc<AtomicU64>`. Only the HTTP server and formatt
 
 ---
 
-### T2.6 — Upstream git rebase and submission
+### T2.6 — Upstream git submission to lumifaza/inferno
 
-**Context**: Branch `fix/dc-latency-display` is 6 commits ahead of `origin/dev`. Two commits (`84fe1a5` and `48da877`) are intermediate steps that were superseded. The upstream `origin/latency_reporting` branch also exists and may conflict.
+**Status**: ⏳ Pending — branch `fix/dc-latency-display` has been merged into `legopc/inferno dev` (merged May 2026). The `legopc/inferno-dc-stats` repo is archived. All DC integration work now lives in `legopc/inferno`.
 
-Recommended rebase plan:
-```bash
-git rebase -i origin/dev
-# fixup 84fe1a5 (sample rate display attempt) into ef1136f
-# fixup 48da877 (count=1 intermediate) into ef1136f
-# keep: e45dd46, ef1136f, 89b4644, 895ec46
-```
+**Next step**: Submit a PR from `legopc/inferno` to `gitlab.com/lumifaza/inferno` (upstream). This requires:
+1. Cherry-pick or rebase the clean commits from `dev` that are not in upstream
+2. Strip intermediate/fixup commits before submission
+3. Open a GitLab MR with a summary of the DC integration improvements
 
-Result: clean 4-commit series (or 3 if ef1136f and 89b4644 merge cleanly).
-
-**Readiness score**: 6/10 — rebase cleans it to ~8/10. No test coverage is the main remaining gap.
-**Complexity**: Medium (git surgery + potential conflict resolution + test writing for readiness).
+**Complexity**: Medium — requires git surgery for a clean commit series and upstream review.
 
 ---
 
@@ -356,6 +350,30 @@ Fix: use an `Instant` initialised to `now() - 31s` so the first error always log
 Currently returns 110 zero bytes. The known property keys include latency values (RX/TX). A partial implementation returning the configured latency values for the keys DC actually queries would satisfy DC's latency negotiation queries.
 
 **Complexity**: Medium — requires Wireshark capture of DC's `0x1100` request to understand which keys it queries.
+
+---
+
+### T2.9 — Validate 0x8002 audio peak format vs certified Dante device
+
+**Context**: The `0x8002` peak level format was reverse-engineered from another Inferno device (not a Shure/certified device). The format appears self-consistent and peaks vary with audio, but has not been validated against a reference.
+
+**Task**: Capture `0x8002` packets from the Shure MXWANI8 during active audio using the `inferno-dante-capture-wait` skill. Compare byte layout to inferno's implementation in `send_audio_level()`.
+
+**Blocker**: Requires active audio playing through the Shure during capture (otherwise peaks are all zero).
+
+**Complexity**: Low (capture task).
+
+---
+
+### T2.10 — Investigate `arcp_vers=2.7.41` in mDNS
+
+**Context**: `mdns_server.rs` advertises `arcp_vers=2.7.41`. This likely overstates the ARC implementation level — inferno handles ~15–19 opcodes; it is unclear what 2.7.41 implies in terms of capability.
+
+**Task**: Capture what DC sends to a device advertising a lower `arcp_vers` (e.g., 1.0.0 or 2.0.0) versus what it sends to inferno. If DC skips certain queries at lower versions, lowering is safe and more honest.
+
+**Risk**: If DC sends fewer queries to a lower-versioned device, changing the version could break existing functionality. Do not change without capture validation.
+
+**Complexity**: Low (capture + comparison task).
 
 ---
 
@@ -552,6 +570,85 @@ full reboot after a clear config.
 
 ---
 
+### T3.10 — Identify button handler (conmon `0x0BC8`)
+
+**Context**: DC shows an "Identify" button for Inferno because `board_info[0x17] bit 0x08` is set. Opcode `0x0BC8` is confirmed from the `chris-ritsen/network-audio-controller` community packet dissector.
+
+**What Identify should do**: On a software device, produce a visible/audible notification — e.g., log a prominent `warn!` message, write to a file, or send a D-Bus notification. (Hardware Dante devices blink an LED.)
+
+**Implementation**: Add a match arm for `0x0BC8` in `info_mcast_server.rs` alongside the existing reboot handler. Send an appropriate ack. No board_info changes needed.
+
+**Complexity**: Low — opcode known, no capture needed.
+
+---
+
+### T3.11 — Persistent subscription state across restarts
+
+**Context**: When inferno restarts (reboot, systemd restart, or Clear Config), all Dante channel subscriptions are lost. DC must manually re-route every channel. In a fixed installation this is a UX problem.
+
+**Implementation sketch**:
+1. Serialize subscription state on each `0x3010` `set_channels_subscriptions` call to a state file (e.g., `/var/lib/inferno/subscriptions.json` or `~/.local/share/inferno/subscriptions.json`)
+2. On startup, load and restore the serialized state
+3. On Clear Config (`0x0077`, T3.9), wipe the state file before exiting
+
+**Risk**: Stale subscriptions after network topology changes (e.g., a TX device is removed). The state file must be treated as a hint, not authoritative truth — DC will re-negotiate if the subscription fails.
+
+**Dependency**: Implement T3.9 (Clear Config exit+restart) first so the wipe-on-clear behaviour works correctly.
+
+**Complexity**: Medium — state serialization format design + restore flow in `channels_subscriber.rs`.
+
+---
+
+### T3.12 — Gain control via DC (conmon `0x0326`/`0x0344`) — SCAFFOLD / RESEARCH
+
+**Status**: Research and architecture scaffolding only. Do NOT implement until all prerequisites are resolved.
+
+**Opcodes** (confirmed from `chris-ritsen/network-audio-controller` dissector):
+- `0x0326` — set output gain
+- `0x0344` — set input gain
+
+**Open prerequisites (all must be resolved before coding starts)**:
+
+1. **board_info capability bit** — which bit advertises gain control support to DC? Unknown. Requires a packet capture comparison between a device that shows gain controls in DC and one that does not. Until this is known, we cannot signal gain support without risking unexpected DC behaviour.
+
+2. **Packet format** — exact wire format of `0x0326`/`0x0344` is not confirmed. The dissector names the opcode but does not document the payload (gain value encoding, channel index, range). Requires a DC capture during a gain adjustment action.
+
+3. **ALSA integration path** — inferno runs as an ALSA plugin inside a host app pipeline (`librespot`, `alsaloop`). Adjusting gain from within the plugin requires calling into ALSA mixer controls. Two options:
+   - Sidecar: a small daemon outside the plugin that owns ALSA mixer controls and receives gain commands via IPC
+   - Plugin-internal: call `snd_mixer_*` from within the plugin (requires the ALSA device to expose a software volume control)
+   Decision requires knowing the target ALSA device's mixer topology.
+
+4. **ALSA element selection** — which mixer element maps to Dante RX/TX gain? Device-specific. No portable answer. Must be documented per-deployment.
+
+**Complexity**: High. All 4 prerequisites are blockers.
+
+---
+
+### T3.13 — Sample rate change from DC (conmon `0x0081`) — SCAFFOLD / RESEARCH
+
+**Status**: Research and architecture scaffolding only. Do NOT implement until all prerequisites are resolved.
+
+**Opcode**: `0x0081` — set sample rate (confirmed from `chris-ritsen/network-audio-controller` dissector)
+
+**Open prerequisites (all must be resolved before coding starts)**:
+
+1. **board_info gate** — `board_info[0x17] bit 0x10` must be set for DC to present rate as editable. Currently intentionally NOT set (see T3.3). Setting this bit without a working handler causes DC to send `0x0081` and see no response, leading to a confusing UX. Only set after handler is ready.
+
+2. **Packet format** — exact encoding of the new sample rate in the `0x0081` payload is not documented. Requires a DC capture during a sample rate change on a device that supports it.
+
+3. **ALSA plugin lifecycle blocker (architectural)** — inferno runs as an ALSA PCM plugin inside a running pipeline. The ALSA plugin contract does not provide a mechanism for the plugin to restart the host app at a different sample rate. A sample rate change from DC cannot be applied without:
+   - The host app (`librespot`, `alsaloop`) being restarted at the new rate, OR
+   - A wrapper script or systemd unit that monitors inferno state and restarts the pipeline
+   This is an architectural constraint that cannot be worked around at the plugin level alone.
+
+4. **Config persistence** — the sample rate is currently set via environment variable / `.asoundrc`. A rate change from DC must persist across restarts. Requires a writable config file (not `.asoundrc`).
+
+5. **systemd coordination** — a service restart is likely required after a rate change. The restart sequence must be ordered correctly (inferno → host pipeline) to avoid audio glitches.
+
+**Complexity**: High — architectural change required before protocol work can land.
+
+---
+
 ## Tier 4 — Hardware Migration (Long-term)
 
 ### T4.1 — PREEMPT_RT kernel on dante-doos
@@ -597,12 +694,32 @@ Steps:
 
 ---
 
+### T4.4 — Document build reproducibility hash-check workflow
+
+**Context**: Verified in May 2026 that a source-neutral merge (docs + patches only, no Rust code changes) produces an identical `.so` binary (same SHA-256 hash before and after).
+
+**Workflow** (to document in the Build section of ARCHITECTURE.md):
+```bash
+# Before any merge or pull that might affect source:
+sha256sum ~/.local/lib/alsa-lib/libasound_module_pcm_inferno.so
+
+# After rebuild (no Rust source changes → hash must be identical):
+cargo build --release
+sha256sum target/release/libasound_module_pcm_inferno.so
+# If hashes match: safe to deploy; no behaviour change
+# If hashes differ: investigate what changed in Rust source
+```
+
+**Complexity**: Documentation only (ARCHITECTURE.md Build section).
+
+---
+
 ## PTP Accuracy Reference Table
 
 | Configuration | Estimated PTP Jitter | Min Buffer | Notes |
 |---|---|---|---|
-| **Current** (RTL8111, SCHED_OTHER, debug + `loglevel=trace`) | ±500µs–2ms | 2–3ms | Measured live |
-| + T1.1 release build + `loglevel=info` + T1.2 SCHED_FIFO | ±100–500µs | 1–1.5ms | No hardware changes |
+| **Baseline** (RTL8111, SCHED_OTHER, debug + `loglevel=trace`) | ±500µs–2ms | 2–3ms | Pre-T1.1 baseline |
+| **Current** (T1.1 + T1.2 done — release build + SCHED_FIFO) | ±100–500µs | 1–1.5ms | ✅ Deployed May 2026 |
 | + T4.1 PREEMPT_RT kernel | ±50–200µs | 0.5–1ms | Kernel package only |
 | + T4.3 `SO_TIMESTAMPING` in Inferno | ±30–100µs | 0.3–0.5ms | Code change required |
 | T4.2 Intel I219-LM hardware PTP | ±30–100ns | 0.1–0.3ms | Hardware migration |
@@ -647,17 +764,28 @@ Steps:
 ## Recommended Implementation Order
 
 ```
-Phase 1 (1–2 hours, no risk):
-  T1.1 → T1.2 → T1.9 → T1.6 → T1.7 → T1.10
+Phase 1 ✅ Done (Apr–May 2026):
+  T1.1 → T1.2 → T1.3 → T1.4 → T1.5 → T1.6 → T1.7 → T1.8 → T1.9 → T1.10
+  T2.1 (audio peaks) → T2.2 (missed packets) → T2.4 (heartbeat) → T2.5 (unit tests)
+  T2.7 (log rate-limit) → T3.4 (reboot) → T3.7/T3.8 (tab investigation)
+  ARC 0x2204 stub, CMC 0x1200 start code, CMC 0x3010 echo handler
 
-Phase 2 (low risk code changes, days):
-  T1.3 → T1.4 → T1.5 → T1.8 → T2.7 → T2.3
+Phase 2 — Next up (low–medium risk):
+  T2.9 (validate 0x8002 peaks vs Shure capture) → T2.10 (investigate arcp_vers)
+  T2.8 (0x1100 property query) → T2.3 (clock domain)
+  T3.9 (Clear Config exit+restart) → T3.10 (Identify 0x0BC8 handler)
+  T3.11 (persistent subscription state) → T2.6 (upstream GitLab submission)
 
-Phase 3 (medium complexity, test coverage):
-  T2.1 (audio peaks) → T2.2 (real missed packets) → T2.5 (unit tests) → T2.6 (upstream rebase)
+Phase 3 — Medium complexity:
+  T3.5 (device lock) → T3.7 follow-up (Switch Config opcode capture + stub)
 
-Phase 4 (long-term, hardware/major features):
-  T1.1+T4.1 (PREEMPT_RT) → T4.2 (EliteDesk migration) → T3.1 (AES67) → T3.2 (unicast)
+Phase 4 — Blocked/research (see scaffolding items):
+  T3.12 (gain — all 4 prerequisites must be resolved first)
+  T3.13 (sample rate change — ALSA lifecycle blocker must be resolved first)
+
+Phase 5 — Long-term hardware:
+  T4.1 (PREEMPT_RT) → T4.2 (EliteDesk-01 I219-LM) → T4.3 (SO_TIMESTAMPING)
+  T3.1 (AES67) → T3.2 (unicast) → T3.6 (SafeClock fallback)
 ```
 
 ---
