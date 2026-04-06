@@ -206,6 +206,9 @@ impl<'s> Multicaster<'s> {
       // Shure MXWANI8 sends both every second as two separate UDP datagrams.
       // Each group has its own block seqnum counter (independent of the packet seqnum).
       {
+        // T2.1: get audio peaks before building the buffer (requires &mut self)
+        let (tx_peaks, rx_peaks) = (self.get_peaks)();
+
         let ctr = self.util_block_seqnum;
         let mut bytes = ByteBuffer::new();
         bytes.set_endian(bytebuffer::Endian::BigEndian);
@@ -232,6 +235,35 @@ impl<'s> Multicaster<'s> {
         bytes.write_u16(ctr);
         bytes.write_u16(0);
         bytes.write_i32(freq_offset);
+
+        // T2.1: 0x8002 audio peak levels per channel
+        // Format (from Dante device capture): [num_tx u16][num_rx u16][reserved u32]
+        //   [bits_per_sample u16][reserved u16][tx peaks u8...][rx peaks u8...][pad if odd]
+        {
+          let num_tx = tx_peaks.len() as u16;
+          let num_rx = rx_peaks.len() as u16;
+          let peak_bytes = tx_peaks.len() + rx_peaks.len();
+          let padded_peak_bytes = (peak_bytes + 1) & !1; // round up to even boundary
+          let data_len = (12 + padded_peak_bytes) as u16;
+          let block_len = 12 + data_len;
+          bytes.write_u16(block_len);
+          bytes.write_u16(0x8002);
+          bytes.write_u16(4);
+          bytes.write_u16(data_len);
+          bytes.write_u16(ctr);
+          bytes.write_u16(0);
+          bytes.write_u16(num_tx);
+          bytes.write_u16(num_rx);
+          bytes.write_u32(0); // reserved
+          bytes.write_u16(self.self_info.bits_per_sample as u16);
+          bytes.write_u16(0); // reserved
+          for &p in tx_peaks.iter().chain(rx_peaks.iter()) {
+            bytes.write_u8(p);
+          }
+          if peak_bytes & 1 != 0 {
+            bytes.write_u8(0); // alignment padding
+          }
+        }
 
         self.util_block_seqnum = self.util_block_seqnum.wrapping_add(1);
         let content = bytes.as_bytes().to_vec();
