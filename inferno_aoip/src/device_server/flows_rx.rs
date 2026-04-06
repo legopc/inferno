@@ -50,6 +50,8 @@ struct SocketData<P: ProxyToSamplesBuffer> {
   empty_sinks_vecs: Vec<Vec<RBInput<Sample, P>>>,
   actual_latency_samples: Arc<AtomicI32>,
   missed_packets: Arc<AtomicU32>,
+  last_rx_timestamp: Option<Clock>,  // T2.2: last received packet timestamp for gap detection
+  last_frame_samples: usize,         // T2.2: frame size seen in previous packet
 }
 
 struct SilenceWriter<P: ProxyToSamplesBuffer> {
@@ -128,8 +130,27 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           if let Some(now) = clock.wrapping_now_in_timebase(sample_rate.into()) {
             let latency = wrapped_diff(now, timestamp).clamp(0, i32::MAX as _);
             sd.actual_latency_samples.fetch_max(latency as _, Ordering::Relaxed);
-            if latency > sd.latency_samples as isize {
-              sd.missed_packets.fetch_add(1, Ordering::Relaxed);
+          }
+
+          // T2.2: detect truly missed packets via timestamp gap (no sequence number in Dante)
+          let num_ch = sd.channels.len();
+          if num_ch > 0 && sd.bytes_per_sample > 0 {
+            let samples_this_pkt = (recv_size - 9) / (num_ch * sd.bytes_per_sample);
+            if samples_this_pkt > 0 {
+              if let (Some(last_ts), frame_sz) = (sd.last_rx_timestamp, sd.last_frame_samples) {
+                if frame_sz > 0 {
+                  let expected_ts = last_ts.wrapping_add(frame_sz as Clock);
+                  let gap = wrapped_diff(timestamp, expected_ts);
+                  if gap > sample_rate as isize * 5 {
+                    // Stream restart or very large gap — reset state, don't count as missed
+                  } else if gap > frame_sz as isize / 2 {
+                    let missed = (gap / frame_sz as isize).max(0) as u32;
+                    sd.missed_packets.fetch_add(missed, Ordering::Relaxed);
+                  }
+                }
+              }
+              sd.last_rx_timestamp = Some(timestamp);
+              sd.last_frame_samples = samples_this_pkt;
             }
           }
 
@@ -600,6 +621,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
           empty_sinks_vecs,
           actual_latency_samples: als,
           missed_packets: mp,
+          last_rx_timestamp: None,
+          last_frame_samples: 0,
         },
       })
       .await
