@@ -531,6 +531,21 @@ pub async fn run_server(
           [0x07, _, 0, 0x83, 0, 0, 0, _] => {
             mcaster.send_encoding().await;
           }
+          [0x07, _, 0, 0x90, 0, 0, 0, _] => {
+            // Reboot command from Dante Controller (conmon message_type=0x0090).
+            // Ack with 0x0092 to 224.0.0.231:8702 so DC knows the command was received,
+            // then exit — systemd Restart=on-failure will re-launch the service.
+            warn!("Reboot requested by Dante Controller — restarting");
+            mcaster.send(
+              mcaster.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x92, 0, 0, 0, 0],
+              &[]
+            ).await;
+            std::process::exit(0);
+          }
+          [0x07, _, 0x10, 0x08, 0, 0, 0, _] => {
+            // DC periodic heartbeat query — normal traffic, no response needed
+            trace!("DC heartbeat query received");
+          }
           _ => {
             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));
             warn!("raw udp payload: {}", hex::encode(request_buf));
