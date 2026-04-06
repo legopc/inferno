@@ -616,6 +616,14 @@ pub async fn run_server(
           }
         }
 
+        0x2204 => {
+          // DC queries TX flow details / lock status (exact semantics not yet reversed).
+          // Observed payload: 000100010000 [u16, u16, u16]. DC polls this continuously.
+          // Respond with CODE_OK to prevent connection drops; content TBD when opcode reversed.
+          trace!("0x2204 (TX flow/lock query)");
+          conn.respond(&[]).await;
+        }
+
         x => {
           error!("received unknown opcode1 {x:#04x}, content {}", hex::encode(request.content()));
           error!("whole packet: {:?}", hex::encode(request.into_storage()));
