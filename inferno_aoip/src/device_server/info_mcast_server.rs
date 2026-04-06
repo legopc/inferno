@@ -66,7 +66,12 @@ impl<'s> Multicaster<'s> {
       server,
       seqnum: 1,
       vendor: [32; 8],
-      firmware_version_bytes: [4, 1, 6, 2],
+      firmware_version_bytes: [
+        env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(), // T1.5: derive from Cargo version like product_version_bytes
+        env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
+        H(patch_version),
+        L(patch_version),
+      ],
       product_version_bytes: [
         env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
         env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
@@ -118,7 +123,7 @@ impl<'s> Multicaster<'s> {
   async fn send_board_info(&mut self) {
     let mut content = [0u8; 200];
     // Firmware version:
-    content[0..4].copy_from_slice(&[4, 1, 0, 6]);
+    content[0..4].copy_from_slice(&self.firmware_version_bytes); // T1.5: use struct field instead of hardcoded literal
     content[0x23] = 2;
     // Hardware version:
     content[4..8].copy_from_slice(&[4, 1, 0, 3]);
@@ -146,9 +151,9 @@ impl<'s> Multicaster<'s> {
     content[0x17] = 0x08; // Identify only — bit 0x10 would make DC show rate/encoding as editable
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
-                          /* content[0xbf] = 5;
-                          content[0xc3] = 3;
-                          content[0xc7] = 3; */
+    content[0xbf] = 5;   // T1.6: limit DC polling rate for board-info sub-types (matches reference capture)
+    content[0xc3] = 3;   // T1.6: rate limit sub-type 3
+    content[0xc7] = 3;   // T1.6: rate limit sub-type 7
     write_str_to_buffer(&mut content, 12, 8, &self.self_info.board_name);
     write_str_to_buffer(&mut content, 0x38, 16, &self.self_info.board_name);
 
@@ -162,7 +167,7 @@ impl<'s> Multicaster<'s> {
     write_str_to_buffer(&mut content, 0x2c, 16, &self.self_info.manufacturer);
     write_str_to_buffer(&mut content, 0xac, 16, &self.self_info.model_name);
     // product version:
-    //content[0x12c..0x130].copy_from_slice(&self.product_version_bytes);
+    content[0x12c..0x130].copy_from_slice(&self.product_version_bytes); // T1.7: populate product version field (same as firmware at 0x1c)
 
     // firmware version:
     content[0x1c..0x20].copy_from_slice(&self.product_version_bytes);
@@ -396,7 +401,8 @@ impl<'s> Multicaster<'s> {
   }
 
   async fn send_sample_rate(&mut self) {
-    // Advertise only 48000 Hz as the single supported rate so DC shows it read-only.
+    // Advertise the configured sample rate as the single supported rate so DC shows it read-only.
+    let sr = (self.self_info.sample_rate as u16).to_be_bytes(); // T1.3: use actual rate, not hardcoded 48000
     self
       .send(
         self.device_info_destination,
@@ -406,17 +412,18 @@ impl<'s> Multicaster<'s> {
           // Header matches Shure MXWANI8 exactly: 0x0018=length, 0x0001=type.
           // Using 0x0004 as type makes DC treat the rate as editable.
           0x00, 0x18, 0x00, 0x01,
-          0x00, 0x00, 0xbb, 0x80, // current sample rate: 48000
-          0x00, 0x00, 0xbb, 0x80, // default sample rate: 48000
-          0x00, 0x01, 0x00, 0x00, // 1 supported rate
-          0x00, 0x00, 0xbb, 0x80, // 48000
+          0x00, 0x00, sr[0], sr[1], // current sample rate: from self_info
+          0x00, 0x00, sr[0], sr[1], // default sample rate: from self_info
+          0x00, 0x01, 0x00, 0x00,   // 1 supported rate
+          0x00, 0x00, sr[0], sr[1], // single supported rate: from self_info
         ],
       )
       .await;
   }
 
   async fn send_encoding(&mut self) {
-    // Advertise only 24-bit as the single supported encoding so DC shows it read-only.
+    // Advertise the configured encoding as the single supported encoding so DC shows it read-only.
+    let bps = (self.self_info.bits_per_sample as u32).to_be_bytes(); // T1.4: use actual bits_per_sample, not hardcoded 0x18
     self
       .send(
         self.device_info_destination,
@@ -425,10 +432,10 @@ impl<'s> Multicaster<'s> {
         &[
           // Use 0x0018/0x0003 to match the non-editable pattern (Shure uses 0x0018/0x0001 for 0x80).
           0x00, 0x18, 0x00, 0x03,
-          0x00, 0x00, 0x00, 0x18, // current encoding: 24-bit (0x18)
-          0x00, 0x00, 0x00, 0x18, // default encoding: 24-bit
-          0x00, 0x01, 0x00, 0x00, // 1 supported encoding
-          0x00, 0x00, 0x00, 0x18, // 24-bit
+          bps[0], bps[1], bps[2], bps[3], // current encoding: bits_per_sample
+          bps[0], bps[1], bps[2], bps[3], // default encoding: bits_per_sample
+          0x00, 0x01, 0x00, 0x00,          // 1 supported encoding
+          bps[0], bps[1], bps[2], bps[3], // single supported encoding: bits_per_sample
         ],
       )
       .await;

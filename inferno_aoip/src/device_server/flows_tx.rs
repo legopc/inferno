@@ -3,7 +3,7 @@ use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
-use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::{AtomicU32, AtomicU64}, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::{AtomicU32, AtomicU64}, time::{Duration, Instant}};
 
 use atomic::Ordering;
 use futures::FutureExt;
@@ -217,6 +217,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     let sample_rate = self.sample_rate;
     let process_events_interval = (sample_rate / 30) as Clock;
     let mut dither_rng = SmallRng::from_rng(rand::thread_rng()).unwrap();
+    let mut last_clock_error_log = Instant::now() - Duration::from_secs(31);
 
     if let Some(rx) = &mut start_time_rx {
       match rx.await {
@@ -249,7 +250,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       if let Some(now) = now_opt {
         break now;
       } else {
-        error!("clock unavailable, can't transmit. is the PTP daemon running? (@init)");
+        if last_clock_error_log.elapsed() >= Duration::from_secs(30) {
+          error!("clock unavailable, can't transmit. is the PTP daemon running?");
+          last_clock_error_log = Instant::now();
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
       }
     };
@@ -281,7 +285,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       let now = if let Some(now) = self.now() {
         now
       } else {
-        error!("clock unavailable, can't transmit. is the PTP daemon running? (@get now)");
+        if last_clock_error_log.elapsed() >= Duration::from_secs(30) {
+          error!("clock unavailable, can't transmit. is the PTP daemon running?");
+          last_clock_error_log = Instant::now();
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
         continue;
       };
@@ -314,7 +321,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
             Command::NoOp
           }
         } else {
-          error!("clock unavailable, can't transmit. is the PTP daemon running? (@non-select)");
+          if last_clock_error_log.elapsed() >= Duration::from_secs(30) {
+            error!("clock unavailable, can't transmit. is the PTP daemon running?");
+            last_clock_error_log = Instant::now();
+          }
           self.commands_receiver.try_recv().unwrap_or(Command::NoOp)
         }
       } else {
@@ -331,7 +341,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
             if let Some(now) = self.now() {
               self.transmit(&mut dither_rng, now, true);
             } else {
-              error!("clock unavailable, can't transmit. is the PTP daemon running? (@select)");
+              if last_clock_error_log.elapsed() >= Duration::from_secs(30) {
+                error!("clock unavailable, can't transmit. is the PTP daemon running?");
+                last_clock_error_log = Instant::now();
+              }
             }
             Command::NoOp
           }
