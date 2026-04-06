@@ -144,11 +144,11 @@ impl<'s> Multicaster<'s> {
     //   0x08 = Identify device (LED blink)
     //   0x10 = Sample rate & encoding (enables DC to query/display these values)
     //   0x40 = Reboot (enables the Reboot button in DC Device Config panel)
-    //   0x80 = Factory reset (intentionally omitted — we don't implement factory reset)
+    //   0x80 = Factory reset (button enabled in DC; handler is a no-op — we just log and ignore)
     content[0x14] = 0;
     content[0x15] = 0;
     content[0x16] = 0x10;
-    content[0x17] = 0x08 | 0x40; // Identify + Reboot; 0x80 (factory reset) intentionally excluded
+    content[0x17] = 0x08 | 0x40 | 0x80; // Identify + Reboot + Factory Reset (factory reset is a no-op)
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
     content[0xbf] = 5;   // T1.6: limit DC polling rate for board-info sub-types (matches reference capture)
@@ -545,6 +545,11 @@ pub async fn run_server(
           [0x07, _, 0x10, 0x08, 0, 0, 0, _] => {
             // DC periodic heartbeat query — normal traffic, no response needed
             trace!("DC heartbeat query received");
+          }
+          [0x07, _, 0, 0x91, 0, 0, 0, _] => {
+            // Factory reset command from DC — advertised as supported (flag 0x80) so button
+            // is enabled, but we deliberately do nothing. Inferno has no persistent state to clear.
+            warn!("Factory reset requested by DC — ignored (not implemented)");
           }
           _ => {
             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));
