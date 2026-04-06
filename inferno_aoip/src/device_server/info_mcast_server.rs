@@ -524,11 +524,14 @@ pub async fn run_server(
           [0x07, _, 0, 0x13, 0, 0, 0, _] => {
             mcaster.send_network_info().await;
           }
-          [0x07, _, 0, 0x77, 0, 0, 0, _]=> {
+          [0x07, _, 0, 0x77, 0, 0, 0, _] => {
+            // T3.9: clear config — exit(0), systemd Restart=on-failure relaunches
+            warn!("Clear Config requested by Dante Controller — restarting");
             mcaster.send(
               mcaster.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x78, 0, 0, 0, 0],
               &[0, 0, 0, 3, 0, 0, 0, 0]
             ).await;
+            std::process::exit(0);
           }
           [0x07, _, 0, 0x81, 0, 0, 0, _] => {
             mcaster.send_sample_rate().await;
@@ -557,12 +560,6 @@ pub async fn run_server(
             // 0x3010 for devices that don't advertise factory reset support), but handle it
             // defensively in case another controller sends it.
             warn!("Factory reset requested by DC — ignored (not implemented)");
-          }
-          [0x07, _, 0, 0x77, 0, 0, 0, _] => {
-            // Clear Config command from DC (conmon message_type=0x0077).
-            // Inferno has no persistent Dante config to clear — device name and channel
-            // assignments live only in the running process. Deliberately ignored.
-            warn!("Clear Config requested by DC — ignored (not implemented)");
           }
           _ => {
             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));
