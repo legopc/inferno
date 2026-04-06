@@ -631,3 +631,27 @@ pub async fn run_server(
     }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use crate::protocol::proto_arc;
+
+  /// Regression guard: DC uses these opcodes to build the routing tab.
+  /// If any opcode constant changes, DC integration will silently break.
+  #[test]
+  fn routing_tab_opcodes_are_stable() {
+    assert_eq!(proto_arc::channels_and_flows_count::OPCODE, 0x1000u16,
+      "channels_and_flows_count opcode mismatch — DC routing tab will break");
+    assert_eq!(proto_arc::get_receive_channels::OPCODE, 0x3000u16,
+      "get_receive_channels opcode mismatch — RX channels will not show in DC");
+    assert_eq!(proto_arc::get_transmit_channels::OPCODE, 0x2000u16,
+      "get_transmit_channels opcode mismatch — TX channels will not show in DC");
+  }
+
+  /// Regression guard: set_channels_subscriptions opcode drives the subscription flow.
+  #[test]
+  fn subscription_opcode_is_stable() {
+    assert_eq!(proto_arc::set_channels_subscriptions::OPCODE, 0x3010u16,
+      "set_channels_subscriptions opcode mismatch — routing changes from DC will break");
+  }
+}

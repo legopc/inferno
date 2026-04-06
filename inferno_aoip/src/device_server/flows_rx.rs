@@ -23,6 +23,29 @@ use tokio::sync::mpsc::error::TryRecvError;
 use usrvclock::ClockOverlay;
 
 pub const MAX_FLOWS: usize = 32;
+
+/// T2.5: Pure function extracted from `receive()` for testability.
+///
+/// Given the previous packet's timestamp (`last_ts`) and frame size in samples (`last_frame`),
+/// and a newly-received packet's timestamp (`new_ts`) at `sample_rate`, returns how many audio
+/// frames appear to have been dropped between the two packets.
+///
+/// Returns 0 for:
+/// - `last_frame == 0` (no prior data)
+/// - gaps within half a frame (normal jitter)
+/// - gaps larger than 5 seconds (treated as a stream restart, not genuine drops)
+pub(crate) fn count_missed_packets(last_ts: Clock, last_frame: usize, new_ts: Clock, sample_rate: u32) -> u32 {
+  if last_frame == 0 { return 0; }
+  let expected_ts = last_ts.wrapping_add(last_frame as Clock);
+  let gap = wrapped_diff(new_ts, expected_ts);
+  if gap > sample_rate as isize * 5 {
+    0 // stream restart — don't count as dropped
+  } else if gap > last_frame as isize / 2 {
+    (gap / last_frame as isize).max(0) as u32
+  } else {
+    0
+  }
+}
 const WAKE_TOKEN: mio::Token = mio::Token(MAX_FLOWS);
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
 pub const CLOSING_SAMPLES_INTERVAL: Duration = Duration::from_millis(1);
@@ -137,16 +160,10 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           if num_ch > 0 && sd.bytes_per_sample > 0 {
             let samples_this_pkt = (recv_size - 9) / (num_ch * sd.bytes_per_sample);
             if samples_this_pkt > 0 {
-              if let (Some(last_ts), frame_sz) = (sd.last_rx_timestamp, sd.last_frame_samples) {
-                if frame_sz > 0 {
-                  let expected_ts = last_ts.wrapping_add(frame_sz as Clock);
-                  let gap = wrapped_diff(timestamp, expected_ts);
-                  if gap > sample_rate as isize * 5 {
-                    // Stream restart or very large gap — reset state, don't count as missed
-                  } else if gap > frame_sz as isize / 2 {
-                    let missed = (gap / frame_sz as isize).max(0) as u32;
-                    sd.missed_packets.fetch_add(missed, Ordering::Relaxed);
-                  }
+              if let Some(last_ts) = sd.last_rx_timestamp {
+                let missed = count_missed_packets(last_ts, sd.last_frame_samples, timestamp, sample_rate);
+                if missed > 0 {
+                  sd.missed_packets.fetch_add(missed, Ordering::Relaxed);
                 }
               }
               sd.last_rx_timestamp = Some(timestamp);
@@ -678,5 +695,66 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       .await
       .log_and_forget();
     self.waker.wake().log_and_forget();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  const SR: u32 = 48_000; // sample rate used in tests
+  const FRAME: usize = 48; // 48 samples = 1 ms frame @ 48 kHz
+
+  #[test]
+  fn no_gap_returns_zero() {
+    // Consecutive frames — no missed packets expected
+    let missed = count_missed_packets(0, FRAME, FRAME, SR);
+    assert_eq!(missed, 0, "back-to-back frames should report 0 missed");
+  }
+
+  #[test]
+  fn exact_one_missed() {
+    // Skipped one frame: last_ts=0, expected next=FRAME, but got 2*FRAME
+    let missed = count_missed_packets(0, FRAME, FRAME * 2, SR);
+    assert_eq!(missed, 1);
+  }
+
+  #[test]
+  fn several_missed() {
+    // 5 frames later — 4 missed
+    let missed = count_missed_packets(0, FRAME, FRAME * 5, SR);
+    assert_eq!(missed, 4);
+  }
+
+  #[test]
+  fn stream_restart_not_counted() {
+    // Gap > 5 seconds → stream restart, not counted as dropped
+    let ts1: Clock = SR as Clock * 6;
+    let missed = count_missed_packets(0, FRAME, ts1, SR);
+    assert_eq!(missed, 0, "huge gap should be treated as restart, not drops");
+  }
+
+  #[test]
+  fn small_jitter_not_counted() {
+    // Gap smaller than half a frame → normal network jitter, not a drop
+    let ts1: Clock = FRAME + FRAME / 4;
+    let missed = count_missed_packets(0, FRAME, ts1, SR);
+    assert_eq!(missed, 0, "sub-half-frame gap should not count as missed");
+  }
+
+  #[test]
+  fn zero_last_frame_returns_zero() {
+    // No prior frame size known — cannot compute gap
+    let missed = count_missed_packets(0, 0, FRAME * 3, SR);
+    assert_eq!(missed, 0, "unknown prior frame size should return 0");
+  }
+
+  #[test]
+  fn wrapping_timestamps_no_false_positive() {
+    // Timestamps wrap around usize::MAX — should still detect no drop for sequential frames
+    let ts0: Clock = usize::MAX - FRAME / 2;
+    let ts1: Clock = ts0.wrapping_add(FRAME);
+    let missed = count_missed_packets(ts0, FRAME, ts1, SR);
+    assert_eq!(missed, 0, "wrapped sequential timestamps should report 0 missed");
   }
 }
