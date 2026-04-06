@@ -6,7 +6,7 @@ use crate::protocol::mcast::{make_packet, MulticastMessage};
 use crate::media_clock::MediaClock;
 use crate::{byte_utils::write_str_to_buffer, device_info::DeviceInfo};
 use bytebuffer::ByteBuffer;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::{
   net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -40,6 +40,13 @@ struct Multicaster<'s> {
   clock: Arc<RwLock<MediaClock>>,
   channels_subscriber: Option<Arc<ChannelsSubscriber>>,
   get_peaks: PeaksCallback,
+  // Each block group has its own seqnum counter, matching the Shure MXWANI8 pattern.
+  util_block_seqnum: u16,    // for 0x8000+0x8001 packets
+  latency_block_seqnum: u16, // for 0x8003+0x8004 packets
+  tx_bytes: Arc<AtomicU64>,
+  rx_bytes: Arc<AtomicU64>,
+  tx_errors: Arc<AtomicU32>,
+  rx_errors: Arc<AtomicU32>,
 }
 
 impl<'s> Multicaster<'s> {
@@ -48,6 +55,10 @@ impl<'s> Multicaster<'s> {
     server: UdpSocketWrapper,
     clock: Arc<RwLock<MediaClock>>,
     get_peaks: PeaksCallback,
+    tx_bytes: Arc<AtomicU64>,
+    rx_bytes: Arc<AtomicU64>,
+    tx_errors: Arc<AtomicU32>,
+    rx_errors: Arc<AtomicU32>,
   ) -> Multicaster {
     let patch_version = env!("CARGO_PKG_VERSION_PATCH").parse::<u16>().unwrap();
     let mut r = Multicaster {
@@ -55,7 +66,12 @@ impl<'s> Multicaster<'s> {
       server,
       seqnum: 1,
       vendor: [32; 8],
-      firmware_version_bytes: [4, 1, 6, 2],
+      firmware_version_bytes: [
+        env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(), // T1.5: derive from Cargo version like product_version_bytes
+        env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
+        H(patch_version),
+        L(patch_version),
+      ],
       product_version_bytes: [
         env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
         env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
@@ -74,6 +90,12 @@ impl<'s> Multicaster<'s> {
       clock,
       channels_subscriber: None,
       get_peaks,
+      util_block_seqnum: 1,
+      latency_block_seqnum: 1,
+      tx_bytes,
+      rx_bytes,
+      tx_errors,
+      rx_errors,
     };
     write_str_to_buffer(&mut r.vendor, 0, 8, &self_info.vendor_string);
     return r;
@@ -101,7 +123,7 @@ impl<'s> Multicaster<'s> {
   async fn send_board_info(&mut self) {
     let mut content = [0u8; 200];
     // Firmware version:
-    content[0..4].copy_from_slice(&[4, 1, 0, 6]);
+    content[0..4].copy_from_slice(&self.firmware_version_bytes); // T1.5: use struct field instead of hardcoded literal
     content[0x23] = 2;
     // Hardware version:
     content[4..8].copy_from_slice(&[4, 1, 0, 3]);
@@ -111,23 +133,32 @@ impl<'s> Multicaster<'s> {
 
     // flags of supported features:
     // 0x14: AES67, Device Lock
-    //       0x01 - ??? (was 1, od 0xd)
     //       0x04 - supports AES67
     //       0x08 - is lockable
-    // 0x15: ??? (was 0x50)
+    // 0x15: unknown capability flags (Shure MXWANI8 = 0x7c).
+    //       Setting 0x7c greys out the Clear Config button in DC — exact semantics unknown.
+    //       Setting 0x00 causes DC to show Clear Config as clickable (unwanted).
     // 0x16:
     //       0x10 - has Manufacturer name
-    //       0x40 - Network is configurable (supports static addressing)
-    // 0x17: Identify device, Sample rate & encoding configuration, Reboot, Factory reset (was 0xdb)
-    content[0x14] = 0;
-    content[0x15] = 0;
-    content[0x16] = 0x10;
-    content[0x17] = 0;
+    //       0x40 - Network is configurable (supports static addressing) — NOT set:
+    //              omitting this keeps Addresses and Switch Config greyed in DC.
+    // 0x17: feature flags:
+    //   0x01, 0x02 = unknown; required alongside 0x40 for Reboot button to activate in DC
+    //   0x08 = Identify device (LED blink)
+    //   0x40 = Reboot supported
+    //   0x80 = Factory reset supported (intentionally NOT set — we don't support this;
+    //          DC greys the Factory Reset button regardless due to CMC 0x3010 gating)
+    // Note: primary gate for DC management buttons is the CMC 0x3010 keepalive exchange.
+    // Board_info flags provide secondary per-button control on top of that gate.
+    content[0x14] = 0;    // no AES67, not lockable
+    content[0x15] = 0x7c; // required to keep Clear Config greyed in DC (exact bits unknown)
+    content[0x16] = 0x10; // has Manufacturer name only — no 0x40 (keeps Addresses/Switch Config greyed)
+    content[0x17] = 0x4b; // Identify (0x08) + Reboot (0x40) + required companions (0x01|0x02)
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
-                          /* content[0xbf] = 5;
-                          content[0xc3] = 3;
-                          content[0xc7] = 3; */
+    content[0xbf] = 5;   // T1.6: limit DC polling rate for board-info sub-types (matches reference capture)
+    content[0xc3] = 3;   // T1.6: rate limit sub-type 3
+    content[0xc7] = 3;   // T1.6: rate limit sub-type 7
     write_str_to_buffer(&mut content, 12, 8, &self.self_info.board_name);
     write_str_to_buffer(&mut content, 0x38, 16, &self.self_info.board_name);
 
@@ -141,7 +172,7 @@ impl<'s> Multicaster<'s> {
     write_str_to_buffer(&mut content, 0x2c, 16, &self.self_info.manufacturer);
     write_str_to_buffer(&mut content, 0xac, 16, &self.self_info.model_name);
     // product version:
-    //content[0x12c..0x130].copy_from_slice(&self.product_version_bytes);
+    content[0x12c..0x130].copy_from_slice(&self.product_version_bytes); // T1.7: populate product version field (same as firmware at 0x1c)
 
     // firmware version:
     content[0x1c..0x20].copy_from_slice(&self.product_version_bytes);
@@ -172,96 +203,133 @@ impl<'s> Multicaster<'s> {
   }
 
   async fn send_heartbeat(&mut self) {
-    let ctr = self.seqnum;
-    let mut bytes = ByteBuffer::new();
-    bytes.set_endian(bytebuffer::Endian::BigEndian);
-
     let freq_offset_opt = self.get_freq_offset_ppb();
 
     if let Some(freq_offset) = freq_offset_opt {
-      bytes.write_u16(16); // length of this part
-      bytes.write_u16(0x8001); // type
-      bytes.write_u16(4); // ???
-      bytes.write_u16(4); // maybe content length???
-      bytes.write_u16(ctr);
-      bytes.write_u16(0);
-      bytes.write_i32(freq_offset);
-      trace!("freq offset {freq_offset}/1000 ppm");
+      // Packet 1: [0x8000 (utilization) + 0x8001 (clock offset)]
+      // Packet 2: [0x8003 (rx latency) + 0x8004 (missed packets)]
+      // Shure MXWANI8 sends both every second as two separate UDP datagrams.
+      // Each group has its own block seqnum counter (independent of the packet seqnum).
+      {
+        // T2.1: get audio peaks before building the buffer (requires &mut self)
+        let (tx_peaks, rx_peaks) = (self.get_peaks)();
 
-      /* bytes.write_bytes(&[
-        0x00, 0x24, 0x80, 0x00,
-        0x00, 0x04, 0x00, 0x04, H(ctr), L(ctr), 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x10,
-        /* TX Bps, 4B: */ 0x00, 0x00, 0x01, 0xde, /* RX Bps, 4B: */ 0x00, 0x07, 0xdf, 0x17,
-        /* TX errors, 4B: */ 0x00, 0x00, 0x00, 0x02, /* RX errors, 4B: */ 0x00, 0x00, 0x00, 0x07,
-      ]); // network statistics */
+        let ctr = self.util_block_seqnum;
+        let mut bytes = ByteBuffer::new();
+        bytes.set_endian(bytebuffer::Endian::BigEndian);
 
-      let (rx_peaks, tx_peaks) = (self.get_peaks)();
-      let total_peaks = rx_peaks.len() + tx_peaks.len();
-      if total_peaks > 0 {
-        let mut total_len = 24 + total_peaks;
-        while (total_len % 4) != 0 {
-          total_len += 1;
-        }
-        let end_pos = bytes.get_wpos() + total_len;
-        bytes.write_u16((24 + total_peaks).try_into().unwrap());
-        bytes.write_u16(0x8002);
+        bytes.write_u16(36);
+        bytes.write_u16(0x8000);
         bytes.write_u16(4);
-        bytes.write_u16((12 + total_peaks).try_into().unwrap());
+        bytes.write_u16(4);
         bytes.write_u16(ctr);
         bytes.write_u16(0);
-        bytes.write_u16(tx_peaks.len().try_into().unwrap());
+        bytes.write_u16(0x0010); // constant sub-header from Shure capture
+        bytes.write_u16(0x0000);
+        bytes.write_u16(0x0001);
+        bytes.write_u16(0x0010);
+        bytes.write_u32(self.tx_bytes.swap(0, Ordering::Relaxed).min(u32::MAX as u64) as u32); // TX bytes/sec
+        bytes.write_u32(self.rx_bytes.swap(0, Ordering::Relaxed).min(u32::MAX as u64) as u32); // RX bytes/sec
+        bytes.write_u32(self.tx_errors.swap(0, Ordering::Relaxed)); // TX errors
+        bytes.write_u32(self.rx_errors.swap(0, Ordering::Relaxed)); // RX errors
+
+        bytes.write_u16(16);
+        bytes.write_u16(0x8001);
+        bytes.write_u16(4);
+        bytes.write_u16(4);
+        bytes.write_u16(ctr);
         bytes.write_u16(0);
-        bytes.write_u16(rx_peaks.len().try_into().unwrap());
-        bytes.write_u16(0);
-        bytes.write_u16(24);
-        bytes.write_u16(0);
-        for peak in tx_peaks.into_iter().chain(rx_peaks.into_iter()) {
-          bytes.write_u8(peak);
+        bytes.write_i32(freq_offset);
+
+        // T2.1: 0x8002 audio peak levels per channel
+        // Format (from Dante device capture): [num_tx u16][num_rx u16][reserved u32]
+        //   [bits_per_sample u16][reserved u16][tx peaks u8...][rx peaks u8...][pad if odd]
+        {
+          let num_tx = tx_peaks.len() as u16;
+          let num_rx = rx_peaks.len() as u16;
+          let peak_bytes = tx_peaks.len() + rx_peaks.len();
+          let padded_peak_bytes = (peak_bytes + 1) & !1; // round up to even boundary
+          let data_len = (12 + padded_peak_bytes) as u16;
+          let block_len = 12 + data_len;
+          bytes.write_u16(block_len);
+          bytes.write_u16(0x8002);
+          bytes.write_u16(4);
+          bytes.write_u16(data_len);
+          bytes.write_u16(ctr);
+          bytes.write_u16(0);
+          bytes.write_u16(num_tx);
+          bytes.write_u16(num_rx);
+          bytes.write_u32(0); // reserved
+          bytes.write_u16(self.self_info.bits_per_sample as u16);
+          bytes.write_u16(0); // reserved
+          for &p in tx_peaks.iter().chain(rx_peaks.iter()) {
+            bytes.write_u8(p);
+          }
+          if peak_bytes & 1 != 0 {
+            bytes.write_u8(0); // alignment padding
+          }
         }
-        while bytes.get_wpos() < end_pos {
-          bytes.write_u8(0);
-        }
+
+        self.util_block_seqnum = self.util_block_seqnum.wrapping_add(1);
+        let content = bytes.as_bytes().to_vec();
+        self.send(self.heartbeat_destination, 0xfffe, [0, 8, 0, 1, 0x10, 0, 0, 0], &content).await;
       }
 
-      // rx latency:
       if let Some(chsub) = self.channels_subscriber.as_ref() {
-        let flows_info = chsub.flows_info();
-        let flows_info = flows_info.read().unwrap();
-        let flows_count = flows_info.len() as u16;
-        bytes.write_u16(24 + flows_count * 4);
-        bytes.write_u16(0x8003);
-        bytes.write_u16(4);
-        bytes.write_u16(12 + flows_count * 4); // content length
-        bytes.write_u16(ctr);
-        bytes.write_u16(0);
-        bytes.write_u16(flows_count); // number of flows
-        bytes.write_u16(0);
-        bytes.write_u16(24);
-        bytes.write_u16(0);
-        bytes.write_u32(self.self_info.sample_rate);
+        let ctr = self.latency_block_seqnum;
 
-        for opt in flows_info.iter() {
-          let latency =
-            opt.as_ref().map(|fi| fi.actual_latency_samples.swap(0, Ordering::Relaxed)).unwrap_or(0);
-          bytes.write_u32(latency.clamp(0, i32::MAX) as u32);
-        }
+        let content = {
+          let mut bytes = ByteBuffer::new();
+          bytes.set_endian(bytebuffer::Endian::BigEndian);
+
+          let flows_info = chsub.flows_info();
+          let flows_info = flows_info.read().unwrap();
+          let flows_count = flows_info.len() as u16;
+
+          bytes.write_u16(24 + flows_count * 4);
+          bytes.write_u16(0x8003);
+          bytes.write_u16(4);
+          bytes.write_u16(12 + flows_count * 4);
+          bytes.write_u16(ctr);
+          bytes.write_u16(0);
+          bytes.write_u16(flows_count);
+          bytes.write_u16(0);
+          bytes.write_u16(24);
+          bytes.write_u16(0);
+          bytes.write_u32(self.self_info.sample_rate);
+          for opt in flows_info.iter() {
+            let latency =
+              opt.as_ref().map(|fi| fi.actual_latency_samples.swap(0, Ordering::Relaxed)).unwrap_or(0);
+            bytes.write_u32(latency.clamp(0, i32::MAX) as u32);
+          }
+
+          bytes.write_u16(20 + flows_count * 4);
+          bytes.write_u16(0x8004);
+          bytes.write_u16(4);
+          bytes.write_u16(8 + flows_count * 4);
+          bytes.write_u16(ctr);
+          bytes.write_u16(0);
+          bytes.write_u16(flows_count);
+          bytes.write_u16(0);
+          bytes.write_u16(20);
+          bytes.write_u16(0);
+          for opt in flows_info.iter() {
+            let missed = opt
+              .as_ref()
+              .map(|fi| fi.missed_packets.swap(0, Ordering::Relaxed))
+              .unwrap_or(0);
+            bytes.write_u32(missed);
+          }
+          // lock guard dropped here, before the await
+          bytes.as_bytes().to_vec()
+        };
+
+        self.latency_block_seqnum = self.latency_block_seqnum.wrapping_add(1);
+        self.send(self.heartbeat_destination, 0xfffe, [0, 8, 0, 1, 0x10, 0, 0, 0], &content).await;
       }
-
-      /* bytes.write_bytes(&[
-        0x00, 0x1c, 0x80, 0x04,
-        0x00, 0x04, 0x00, 0x10,  H(ctr), L(ctr), 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-      ]); */
-      /*
-      0x00, 0x1c, 0x80, 0x04, 0x00, 0x04, 0x00, 0x10, 0x17, 0x0f, 0x00, 0x00,
-      0x00, 0x02, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, missed packets, 4B: 0x00, 0x03, 0x90, 0x1e, 0x00, 0x00, 0x00, 0x00
-       */
     } else {
       debug!("no clock available");
     }
-
-    let content = bytes.as_bytes();
-    self.send(self.heartbeat_destination, 0xfffe, [0, 8, 0, 1, 0x10, 0, 0, 0], &content).await;
 
     // this is probably response to 0738008100000064
     /* self.send(
@@ -368,6 +436,47 @@ impl<'s> Multicaster<'s> {
       )
       .await;
   }
+
+  async fn send_sample_rate(&mut self) {
+    // Advertise the configured sample rate as the single supported rate so DC shows it read-only.
+    let sr = (self.self_info.sample_rate as u16).to_be_bytes(); // T1.3: use actual rate, not hardcoded 48000
+    self
+      .send(
+        self.device_info_destination,
+        0xffff,
+        [0x07, 0x2a, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[
+          // Header matches Shure MXWANI8 exactly: 0x0018=length, 0x0001=type.
+          // Using 0x0004 as type makes DC treat the rate as editable.
+          0x00, 0x18, 0x00, 0x01,
+          0x00, 0x00, sr[0], sr[1], // current sample rate: from self_info
+          0x00, 0x00, sr[0], sr[1], // default sample rate: from self_info
+          0x00, 0x01, 0x00, 0x00,   // 1 supported rate
+          0x00, 0x00, sr[0], sr[1], // single supported rate: from self_info
+        ],
+      )
+      .await;
+  }
+
+  async fn send_encoding(&mut self) {
+    // Advertise the configured encoding as the single supported encoding so DC shows it read-only.
+    let bps = (self.self_info.bits_per_sample as u32).to_be_bytes(); // T1.4: use actual bits_per_sample, not hardcoded 0x18
+    self
+      .send(
+        self.device_info_destination,
+        0xffff,
+        [0x07, 0x2a, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00],
+        &[
+          // Use 0x0018/0x0003 to match the non-editable pattern (Shure uses 0x0018/0x0001 for 0x80).
+          0x00, 0x18, 0x00, 0x03,
+          bps[0], bps[1], bps[2], bps[3], // current encoding: bits_per_sample
+          bps[0], bps[1], bps[2], bps[3], // default encoding: bits_per_sample
+          0x00, 0x01, 0x00, 0x00,          // 1 supported encoding
+          bps[0], bps[1], bps[2], bps[3], // single supported encoding: bits_per_sample
+        ],
+      )
+      .await;
+  }
 }
 
 pub async fn run_server(
@@ -377,11 +486,15 @@ pub async fn run_server(
   mut channels_sub_rx: watch::Receiver<Option<Arc<ChannelsSubscriber>>>,
   get_peaks: PeaksCallback,
   shutdown: BroadcastReceiver<()>,
+  tx_bytes: Arc<AtomicU64>,
+  rx_bytes: Arc<AtomicU64>,
+  tx_errors: Arc<AtomicU32>,
+  rx_errors: Arc<AtomicU32>,
 ) {
   let server =
     UdpSocketWrapper::new(Some(self_info.ip_address), self_info.info_request_port, shutdown).await;
   let mut recv_buff = crate::net_utils::ReceiveBuffer::new();
-  let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks);
+  let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks, tx_bytes, rx_bytes, tx_errors, rx_errors);
   mcaster.send_board_info().await;
   mcaster.send_product_info().await;
   let mut heartbeat_interval = interval(Duration::from_secs(1));
@@ -416,6 +529,40 @@ pub async fn run_server(
               mcaster.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x78, 0, 0, 0, 0],
               &[0, 0, 0, 3, 0, 0, 0, 0]
             ).await;
+          }
+          [0x07, _, 0, 0x81, 0, 0, 0, _] => {
+            mcaster.send_sample_rate().await;
+          }
+          [0x07, _, 0, 0x83, 0, 0, 0, _] => {
+            mcaster.send_encoding().await;
+          }
+          [0x07, _, 0, 0x90, 0, 0, 0, _] => {
+            // Reboot command from Dante Controller (conmon message_type=0x0090).
+            // Ack with 0x0092 to 224.0.0.231:8702 so DC knows the command was received,
+            // then exit — systemd Restart=on-failure will re-launch the service.
+            warn!("Reboot requested by Dante Controller — restarting");
+            mcaster.send(
+              mcaster.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x92, 0, 0, 0, 0],
+              &[]
+            ).await;
+            std::process::exit(0);
+          }
+          [0x07, _, 0x10, 0x08, 0, 0, 0, _] => {
+            // DC periodic heartbeat query — normal traffic, no response needed
+            trace!("DC heartbeat query received");
+          }
+          [0x07, _, 0, 0x91, 0, 0, 0, _] => {
+            // Factory reset command from DC — deliberately ignored. Inferno has no persistent
+            // state to clear. The button is greyed out in DC (DC does not enable it via CMC
+            // 0x3010 for devices that don't advertise factory reset support), but handle it
+            // defensively in case another controller sends it.
+            warn!("Factory reset requested by DC — ignored (not implemented)");
+          }
+          [0x07, _, 0, 0x77, 0, 0, 0, _] => {
+            // Clear Config command from DC (conmon message_type=0x0077).
+            // Inferno has no persistent Dante config to clear — device name and channel
+            // assignments live only in the running process. Deliberately ignored.
+            warn!("Clear Config requested by DC — ignored (not implemented)");
           }
           _ => {
             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));

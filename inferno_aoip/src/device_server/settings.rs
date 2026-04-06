@@ -124,9 +124,16 @@ fn create_self_info(
     model_number: "_000000000000000b".to_owned(),
     rx_channels: vec![],
     tx_channels: vec![],
-    bits_per_sample: 24, // TODO make it configurable
+    bits_per_sample: settings
+      .get("BITS_PER_SAMPLE")
+      .map(|s| s.parse::<u8>().expect("invalid BITS_PER_SAMPLE, must be integer"))
+      .unwrap_or(24), // T1.4: read from INFERNO_BITS_PER_SAMPLE env var, default 24
     pcm_type: 0xe,
     latency_ns,
+    tx_latency_ns: settings
+      .get("TX_LATENCY_NS")
+      .map(|s| s.parse().expect("invalid TX_LATENCY_NS, must be integer"))
+      .unwrap_or(10_000_000), // T1.8: TX latency for mDNS channel/bundle records
     sample_rate,
 
     arc_port: ARC_PORT,

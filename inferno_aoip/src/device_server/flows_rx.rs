@@ -9,7 +9,7 @@ use crate::{common::*, media_clock::MediaClock};
 
 use std::io::ErrorKind::WouldBlock;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI32, AtomicUsize};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -23,6 +23,29 @@ use tokio::sync::mpsc::error::TryRecvError;
 use usrvclock::ClockOverlay;
 
 pub const MAX_FLOWS: usize = 32;
+
+/// T2.5: Pure function extracted from `receive()` for testability.
+///
+/// Given the previous packet's timestamp (`last_ts`) and frame size in samples (`last_frame`),
+/// and a newly-received packet's timestamp (`new_ts`) at `sample_rate`, returns how many audio
+/// frames appear to have been dropped between the two packets.
+///
+/// Returns 0 for:
+/// - `last_frame == 0` (no prior data)
+/// - gaps within half a frame (normal jitter)
+/// - gaps larger than 5 seconds (treated as a stream restart, not genuine drops)
+pub(crate) fn count_missed_packets(last_ts: Clock, last_frame: usize, new_ts: Clock, sample_rate: u32) -> u32 {
+  if last_frame == 0 { return 0; }
+  let expected_ts = last_ts.wrapping_add(last_frame as Clock);
+  let gap = wrapped_diff(new_ts, expected_ts);
+  if gap > sample_rate as isize * 5 {
+    0 // stream restart — don't count as dropped
+  } else if gap > last_frame as isize / 2 {
+    (gap / last_frame as isize).max(0) as u32
+  } else {
+    0
+  }
+}
 const WAKE_TOKEN: mio::Token = mio::Token(MAX_FLOWS);
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
 pub const CLOSING_SAMPLES_INTERVAL: Duration = Duration::from_millis(1);
@@ -49,6 +72,9 @@ struct SocketData<P: ProxyToSamplesBuffer> {
   channels: Vec<Option<Channel<P>>>,
   empty_sinks_vecs: Vec<Vec<RBInput<Sample, P>>>,
   actual_latency_samples: Arc<AtomicI32>,
+  missed_packets: Arc<AtomicU32>,
+  last_rx_timestamp: Option<Clock>,  // T2.2: last received packet timestamp for gap detection
+  last_frame_samples: usize,         // T2.2: frame size seen in previous packet
 }
 
 struct SilenceWriter<P: ProxyToSamplesBuffer> {
@@ -89,6 +115,8 @@ struct FlowsReceiverInternal<P: ProxyToSamplesBuffer> {
   ref_instant: Instant,
   on_transfer: Option<TransferNotifier>,
   current_timestamp: Arc<AtomicUsize>,
+  rx_bytes: Arc<AtomicU64>,
+  rx_errors: Arc<AtomicU32>,
 }
 
 impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
@@ -99,6 +127,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
     clock: &mut MediaClock,
     ref_instant: Instant,
     write: bool,
+    rx_bytes: &Arc<AtomicU64>,
+    rx_errors: &Arc<AtomicU32>,
   ) -> Command<P> {
     let mut buf = [0; MTU];
     loop {
@@ -106,8 +136,10 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
         Ok((recv_size, src)) => {
           if recv_size < 9 {
             error!("received corrupted (too small) packet on flow socket");
+            rx_errors.fetch_add(1, Ordering::Relaxed);
             return Command::NoOp;
           }
+          rx_bytes.fetch_add(recv_size as u64, Ordering::Relaxed);
           let timestamp = (u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize)
             .wrapping_mul(sample_rate as usize)
             .wrapping_add(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize)
@@ -121,6 +153,22 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           if let Some(now) = clock.wrapping_now_in_timebase(sample_rate.into()) {
             let latency = wrapped_diff(now, timestamp).clamp(0, i32::MAX as _);
             sd.actual_latency_samples.fetch_max(latency as _, Ordering::Relaxed);
+          }
+
+          // T2.2: detect truly missed packets via timestamp gap (no sequence number in Dante)
+          let num_ch = sd.channels.len();
+          if num_ch > 0 && sd.bytes_per_sample > 0 {
+            let samples_this_pkt = (recv_size - 9) / (num_ch * sd.bytes_per_sample);
+            if samples_this_pkt > 0 {
+              if let Some(last_ts) = sd.last_rx_timestamp {
+                let missed = count_missed_packets(last_ts, sd.last_frame_samples, timestamp, sample_rate);
+                if missed > 0 {
+                  sd.missed_packets.fetch_add(missed, Ordering::Relaxed);
+                }
+              }
+              sd.last_rx_timestamp = Some(timestamp);
+              sd.last_frame_samples = samples_this_pkt;
+            }
           }
 
           if write {
@@ -254,6 +302,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
               &mut self.clock,
               self.ref_instant,
               start_time_rx.is_none(),
+              &self.rx_bytes,
+              &self.rx_errors,
             );
           } else {
             warn!("got token not bound to any existing socket");
@@ -449,6 +499,7 @@ pub struct FlowInfo {
   pub channels_map: Vec<BoolVec>,
   pub latency_samples: u32,
   pub actual_latency_samples: Arc<AtomicI32>,
+  pub missed_packets: Arc<AtomicU32>,
 }
 
 pub struct FlowsReceiver<P: ProxyToSamplesBuffer> {
@@ -456,6 +507,8 @@ pub struct FlowsReceiver<P: ProxyToSamplesBuffer> {
   waker: mio::Waker,
   max_channels: usize,
   pub flows_info: Arc<RwLock<Vec<Option<FlowInfo>>>>,
+  pub rx_bytes: Arc<AtomicU64>,
+  pub rx_errors: Arc<AtomicU32>,
 }
 
 impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
@@ -469,6 +522,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
     on_transfer: Option<TransferNotifier>,
     current_timestamp: Arc<AtomicUsize>,
     max_channels: usize,
+    rx_bytes: Arc<AtomicU64>,
+    rx_errors: Arc<AtomicU32>,
   ) {
     let mut internal = FlowsReceiverInternal {
       commands_receiver: rx,
@@ -481,6 +536,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       ref_instant,
       on_transfer,
       current_timestamp,
+      rx_bytes,
+      rx_errors,
     };
     internal.run(start_time_rx);
   }
@@ -491,6 +548,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
+    rx_bytes: Arc<AtomicU64>,
+    rx_errors: Arc<AtomicU32>,
   ) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
     let poll = mio::Poll::new().unwrap();
@@ -499,18 +558,24 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
     let max_channels = self_info.rx_channels.len();
     let thread_join = std::thread::Builder::new()
       .name("flows RX".to_owned())
-      .spawn(move || {
-        Self::run(
-          rx,
-          poll,
-          srate,
-          ref_instant,
-          clock_recv,
-          start_time_rx,
-          on_transfer,
-          current_timestamp,
-          max_channels,
-        );
+      .spawn({
+        let rx_bytes = rx_bytes.clone();
+        let rx_errors = rx_errors.clone();
+        move || {
+          Self::run(
+            rx,
+            poll,
+            srate,
+            ref_instant,
+            clock_recv,
+            start_time_rx,
+            on_transfer,
+            current_timestamp,
+            max_channels,
+            rx_bytes,
+            rx_errors,
+          );
+        }
       })
       .unwrap();
     return (
@@ -519,6 +584,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
         waker,
         max_channels,
         flows_info: Arc::new(RwLock::new((0..MAX_FLOWS).map(|_| None).collect_vec())),
+        rx_bytes,
+        rx_errors,
       },
       thread_join,
     );
@@ -548,11 +615,13 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       .collect_vec();
     let port = socket.local_addr().unwrap().port();
     let als: Arc<AtomicI32> = Arc::new(0.into());
+    let mp: Arc<AtomicU32> = Arc::new(0.into());
     self.flows_info.write().unwrap()[local_index] = Some(FlowInfo {
       rx_port: port,
       channels_map: (0..channels_count).map(|_| boolvec![false; self.max_channels]).collect(),
       latency_samples: latency_samples.try_into().unwrap(),
       actual_latency_samples: als.clone(),
+      missed_packets: mp.clone(),
     });
     self
       .commands_sender
@@ -568,6 +637,9 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
           channels: (0..channels_count).map(|_| None).collect(),
           empty_sinks_vecs,
           actual_latency_samples: als,
+          missed_packets: mp,
+          last_rx_timestamp: None,
+          last_frame_samples: 0,
         },
       })
       .await
@@ -623,5 +695,66 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       .await
       .log_and_forget();
     self.waker.wake().log_and_forget();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  const SR: u32 = 48_000; // sample rate used in tests
+  const FRAME: usize = 48; // 48 samples = 1 ms frame @ 48 kHz
+
+  #[test]
+  fn no_gap_returns_zero() {
+    // Consecutive frames — no missed packets expected
+    let missed = count_missed_packets(0, FRAME, FRAME, SR);
+    assert_eq!(missed, 0, "back-to-back frames should report 0 missed");
+  }
+
+  #[test]
+  fn exact_one_missed() {
+    // Skipped one frame: last_ts=0, expected next=FRAME, but got 2*FRAME
+    let missed = count_missed_packets(0, FRAME, FRAME * 2, SR);
+    assert_eq!(missed, 1);
+  }
+
+  #[test]
+  fn several_missed() {
+    // 5 frames later — 4 missed
+    let missed = count_missed_packets(0, FRAME, FRAME * 5, SR);
+    assert_eq!(missed, 4);
+  }
+
+  #[test]
+  fn stream_restart_not_counted() {
+    // Gap > 5 seconds → stream restart, not counted as dropped
+    let ts1: Clock = SR as Clock * 6;
+    let missed = count_missed_packets(0, FRAME, ts1, SR);
+    assert_eq!(missed, 0, "huge gap should be treated as restart, not drops");
+  }
+
+  #[test]
+  fn small_jitter_not_counted() {
+    // Gap smaller than half a frame → normal network jitter, not a drop
+    let ts1: Clock = FRAME + FRAME / 4;
+    let missed = count_missed_packets(0, FRAME, ts1, SR);
+    assert_eq!(missed, 0, "sub-half-frame gap should not count as missed");
+  }
+
+  #[test]
+  fn zero_last_frame_returns_zero() {
+    // No prior frame size known — cannot compute gap
+    let missed = count_missed_packets(0, 0, FRAME * 3, SR);
+    assert_eq!(missed, 0, "unknown prior frame size should return 0");
+  }
+
+  #[test]
+  fn wrapping_timestamps_no_false_positive() {
+    // Timestamps wrap around usize::MAX — should still detect no drop for sequential frames
+    let ts0: Clock = usize::MAX - FRAME / 2;
+    let ts1: Clock = ts0.wrapping_add(FRAME);
+    let missed = count_missed_packets(ts0, FRAME, ts1, SR);
+    assert_eq!(missed, 0, "wrapped sequential timestamps should report 0 missed");
   }
 }

@@ -124,7 +124,7 @@ pub async fn run_server(
           paginate_respond(
             &mut conn,
             request.content(),
-            if subscriber.is_some() { self_info.rx_channels.len().min(32).try_into().unwrap() } else { 0 },
+            self_info.rx_channels.len().min(32).try_into().unwrap(),
             self_info.rx_channels.iter().enumerate(),
             |(channel_index, ch), bytes| {
               if common_descriptor_offset == 0 {
@@ -132,7 +132,7 @@ pub async fn run_server(
                 common_descriptor_offset = bytes.get_wpos().try_into().unwrap();
                 bytes.write_bytes(descr.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice());
               }
-              let status = subscriber.as_ref().unwrap().channel_status(channel_index);
+              let status = subscriber.as_ref().and_then(|s| s.channel_status(channel_index));
               let (tx_channel_name_offset, tx_hostname_offset) = match &status {
                 None => (0, 0),
                 Some(status) => (
@@ -539,10 +539,8 @@ pub async fn run_server(
           conn.respond(&content).await;
         }
         0x1102 => {
-          // identical for all low channels count devices
-          let content = [0u8; 94];
-          // XXX not necessary
-          /* let content = [
+          // property schema — static for low channel-count devices
+          let content = [
             /* number of items, 2B: */ 0x00, 0x17, 0x80, 0x20, 0x00, 0x01,
             0x80, 0x21, 0x00, 0x03, 0x00, 0x22, 0x00, 0x03, 0x00, 0x23, 0x00, 0x03, 0x00, 0x24, 0x00, 0x01,
             0x02, 0x01, 0x00, 0x03, 0x82, 0x04, 0x00, 0x03, 0x82, 0x05, 0x00, 0x03, 0x02, 0x0a, 0x00, 0x01,
@@ -550,7 +548,7 @@ pub async fn run_server(
             0x02, 0x13, 0x00, 0x01, 0x02, 0x14, 0x00, 0x01, 0x83, 0x01, 0x00, 0x03, 0x83, 0x06, 0x00, 0x01,
             0x83, 0x02, 0x00, 0x01, 0x03, 0x10, 0x00, 0x01, 0x03, 0x11, 0x00, 0x01, 0x03, 0x03, 0x00, 0x03,
             0x83, 0xf0, 0x00, 0x01, 0x06, 0x01, 0x00, 0x01
-          ]; */
+          ];
           conn.respond(&content).await;
         }
         0x3300 => {
@@ -618,6 +616,14 @@ pub async fn run_server(
           }
         }
 
+        0x2204 => {
+          // DC queries TX flow details / lock status (exact semantics not yet reversed).
+          // Observed payload: 000100010000 [u16, u16, u16]. DC polls this continuously.
+          // Respond with CODE_OK to prevent connection drops; content TBD when opcode reversed.
+          trace!("0x2204 (TX flow/lock query)");
+          conn.respond(&[]).await;
+        }
+
         x => {
           error!("received unknown opcode1 {x:#04x}, content {}", hex::encode(request.content()));
           error!("whole packet: {:?}", hex::encode(request.into_storage()));
@@ -631,5 +637,29 @@ pub async fn run_server(
       );
       error!("whole packet: {:?}", hex::encode(request.into_storage()));
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::protocol::proto_arc;
+
+  /// Regression guard: DC uses these opcodes to build the routing tab.
+  /// If any opcode constant changes, DC integration will silently break.
+  #[test]
+  fn routing_tab_opcodes_are_stable() {
+    assert_eq!(proto_arc::channels_and_flows_count::OPCODE, 0x1000u16,
+      "channels_and_flows_count opcode mismatch — DC routing tab will break");
+    assert_eq!(proto_arc::get_receive_channels::OPCODE, 0x3000u16,
+      "get_receive_channels opcode mismatch — RX channels will not show in DC");
+    assert_eq!(proto_arc::get_transmit_channels::OPCODE, 0x2000u16,
+      "get_transmit_channels opcode mismatch — TX channels will not show in DC");
+  }
+
+  /// Regression guard: set_channels_subscriptions opcode drives the subscription flow.
+  #[test]
+  fn subscription_opcode_is_stable() {
+    assert_eq!(proto_arc::set_channels_subscriptions::OPCODE, 0x3010u16,
+      "set_channels_subscriptions opcode mismatch — routing changes from DC will break");
   }
 }
