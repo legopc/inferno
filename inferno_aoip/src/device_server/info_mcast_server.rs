@@ -133,24 +133,27 @@ impl<'s> Multicaster<'s> {
 
     // flags of supported features:
     // 0x14: AES67, Device Lock
-    //       0x01 - ??? (was 1, od 0xd)
     //       0x04 - supports AES67
     //       0x08 - is lockable
-    // 0x15: ??? (was 0x50)
+    // 0x15: unknown capability flags (Shure MXWANI8 = 0x7c).
+    //       Setting 0x7c greys out the Clear Config button in DC — exact semantics unknown.
+    //       Setting 0x00 causes DC to show Clear Config as clickable (unwanted).
     // 0x16:
     //       0x10 - has Manufacturer name
-    //       0x40 - Network is configurable (supports static addressing)
+    //       0x40 - Network is configurable (supports static addressing) — NOT set:
+    //              omitting this keeps Addresses and Switch Config greyed in DC.
     // 0x17: feature flags:
-    //   0x01, 0x02 = unknown (present on Shure MXWANI8 — required alongside reboot/reset flags)
+    //   0x01, 0x02 = unknown; required alongside 0x40 for Reboot button to activate in DC
     //   0x08 = Identify device (LED blink)
-    //   0x10 = Sample rate & encoding (enables DC to query/display these values)
-    //   0x40 = Reboot (enables the Reboot button in DC Device Config panel)
-    //   0x80 = Factory reset (button enabled in DC; handler is a no-op — we just log and ignore)
-    // Bytes 0x14-0x17 set to match Shure MXWANI8 reference values exactly.
-    content[0x14] = 0x86; // AES67 + lockable + device flags (Shure reference value)
-    content[0x15] = 0x7c; // unknown capability bits (Shure reference value)
-    content[0x16] = 0xd4; // manufacturer name + network configurable + flags (Shure reference)
-    content[0x17] = 0xcb; // Identify + Reboot + Factory Reset + bits 0x01|0x02 (Shure reference)
+    //   0x40 = Reboot supported
+    //   0x80 = Factory reset supported (intentionally NOT set — we don't support this;
+    //          DC greys the Factory Reset button regardless due to CMC 0x3010 gating)
+    // Note: primary gate for DC management buttons is the CMC 0x3010 keepalive exchange.
+    // Board_info flags provide secondary per-button control on top of that gate.
+    content[0x14] = 0;    // no AES67, not lockable
+    content[0x15] = 0x7c; // required to keep Clear Config greyed in DC (exact bits unknown)
+    content[0x16] = 0x10; // has Manufacturer name only — no 0x40 (keeps Addresses/Switch Config greyed)
+    content[0x17] = 0x4b; // Identify (0x08) + Reboot (0x40) + required companions (0x01|0x02)
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
     content[0xbf] = 5;   // T1.6: limit DC polling rate for board-info sub-types (matches reference capture)
@@ -549,9 +552,17 @@ pub async fn run_server(
             trace!("DC heartbeat query received");
           }
           [0x07, _, 0, 0x91, 0, 0, 0, _] => {
-            // Factory reset command from DC — advertised as supported (flag 0x80) so button
-            // is enabled, but we deliberately do nothing. Inferno has no persistent state to clear.
+            // Factory reset command from DC — deliberately ignored. Inferno has no persistent
+            // state to clear. The button is greyed out in DC (DC does not enable it via CMC
+            // 0x3010 for devices that don't advertise factory reset support), but handle it
+            // defensively in case another controller sends it.
             warn!("Factory reset requested by DC — ignored (not implemented)");
+          }
+          [0x07, _, 0, 0x77, 0, 0, 0, _] => {
+            // Clear Config command from DC (conmon message_type=0x0077).
+            // Inferno has no persistent Dante config to clear — device name and channel
+            // assignments live only in the running process. Deliberately ignored.
+            warn!("Clear Config requested by DC — ignored (not implemented)");
           }
           _ => {
             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));
