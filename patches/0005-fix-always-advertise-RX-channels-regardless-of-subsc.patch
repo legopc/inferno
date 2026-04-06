@@ -1,0 +1,45 @@
+From 89b464471be62c73fd9f6734e0998af5818d29e5 Mon Sep 17 00:00:00 2001
+From: Jelle Jassies <jellejassies@outlook.com>
+Date: Mon, 6 Apr 2026 00:32:44 +0000
+Subject: [PATCH 5/6] fix: always advertise RX channels regardless of
+ subscriber state
+
+Previously reported 0 RX channels to DC until the ChannelsSubscriber
+was initialized (which only happens when alsaloop starts audio).
+DC queries immediately on device discovery and cached the 0-channel
+response, causing dante-doos-RX to never appear in the routing tab.
+
+Change: always return rx_channels.len() from the configured device info,
+and use and_then() instead of unwrap() for subscriber status lookup so
+no-subscriber (unsubscribed) state is handled gracefully.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ inferno_aoip/src/device_server/arc_server.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/inferno_aoip/src/device_server/arc_server.rs b/inferno_aoip/src/device_server/arc_server.rs
+index 325ee4c..bed3856 100644
+--- a/inferno_aoip/src/device_server/arc_server.rs
++++ b/inferno_aoip/src/device_server/arc_server.rs
+@@ -124,7 +124,7 @@ pub async fn run_server(
+           paginate_respond(
+             &mut conn,
+             request.content(),
+-            if subscriber.is_some() { self_info.rx_channels.len().min(32).try_into().unwrap() } else { 0 },
++            self_info.rx_channels.len().min(32).try_into().unwrap(),
+             self_info.rx_channels.iter().enumerate(),
+             |(channel_index, ch), bytes| {
+               if common_descriptor_offset == 0 {
+@@ -132,7 +132,7 @@ pub async fn run_server(
+                 common_descriptor_offset = bytes.get_wpos().try_into().unwrap();
+                 bytes.write_bytes(descr.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice());
+               }
+-              let status = subscriber.as_ref().unwrap().channel_status(channel_index);
++              let status = subscriber.as_ref().and_then(|s| s.channel_status(channel_index));
+               let (tx_channel_name_offset, tx_hostname_offset) = match &status {
+                 None => (0, 0),
+                 Some(status) => (
+-- 
+2.43.0
+

@@ -1,0 +1,109 @@
+From 327008c2cc22a5e149825d2fe96869dd47ba16f5 Mon Sep 17 00:00:00 2001
+From: Jelle Jassies <jellejassies@outlook.com>
+Date: Mon, 6 Apr 2026 21:54:10 +0000
+Subject: [PATCH] Fix CMC response start code and add 0x3010 controller
+ registration handler
+
+Root cause of greyed-out Reboot button in DC Device Config:
+- DC sends CMC 0x1001 with start code 0x1000
+- Inferno was echoing 0x1000 back in the response (via rem.start_code)
+- Real Dante devices (Shure MXWANI8) respond with 0x1200
+- DC validates this and only sends CMC 0x3010 (controller registration)
+  to devices that reply with the correct 0x1200 response code
+- Without 0x3010 exchange, DC never enables management buttons
+
+Changes:
+- proto_cmc.rs: add RESPONSE_START_CODE=0x1200, REGISTER_CONTROLLER=0x3010
+- req_resp.rs: add respond_with_code_start() and respond_with_struct_start()
+  methods that override the echoed start_code
+- cmc_server.rs: use RESPONSE_START_CODE in DeviceAdvertisement reply;
+  add REGISTER_CONTROLLER (0x3010) echo handler so DC can complete
+  the bidirectional keepalive that gates button availability
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ inferno_aoip/src/device_server/cmc_server.rs | 12 ++++++++++--
+ inferno_aoip/src/protocol/proto_cmc.rs       | 13 +++++++++++--
+ inferno_aoip/src/protocol/req_resp.rs        |  7 +++++++
+ 3 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/inferno_aoip/src/device_server/cmc_server.rs b/inferno_aoip/src/device_server/cmc_server.rs
+index 2d4a978..c69110b 100644
+--- a/inferno_aoip/src/device_server/cmc_server.rs
++++ b/inferno_aoip/src/device_server/cmc_server.rs
+@@ -6,7 +6,6 @@ use crate::device_info::DeviceInfo;
+ use crate::net_utils::UdpSocketWrapper;
+ use crate::protocol::req_resp;
+ use crate::protocol::proto_cmc::*;
+-use bytebuffer::ByteBuffer;
+ use tokio::sync::broadcast::Receiver as BroadcastReceiver;
+ 
+ pub async fn run_server(self_info: Arc<DeviceInfo>, shutdown: BroadcastReceiver<()>) {
+@@ -31,7 +30,16 @@ pub async fn run_server(self_info: Arc<DeviceInfo>, shutdown: BroadcastReceiver<
+             info_request_port: self_info.info_request_port,
+             unknown3_0: 0,
+           };
+-          conn.respond_with_struct(CODE_OK, adv).await;
++          // DC sends CMC requests with start code 0x1000; devices must respond with 0x1200.
++          // DC validates this and only sends the 0x3010 controller-registration keepalive
++          // (which gates management button availability) to devices that reply correctly.
++          conn.respond_with_struct_start(RESPONSE_START_CODE, CODE_OK, adv).await;
++        }
++        REGISTER_CONTROLLER => {
++          // Echo the 0x3010 registration packet back verbatim — this is what real Dante devices do.
++          // DC sends this every ~3.25s; the bidirectional exchange enables Device Config buttons.
++          let content = request.content().to_vec();
++          conn.respond_with_code_start(RESPONSE_START_CODE, CODE_OK, &content).await;
+         }
+         other => {
+           error!("received unknown opcode1 {other:#04x}, content {}", hex::encode(request.content()));
+diff --git a/inferno_aoip/src/protocol/proto_cmc.rs b/inferno_aoip/src/protocol/proto_cmc.rs
+index c6fbd28..db7d257 100644
+--- a/inferno_aoip/src/protocol/proto_cmc.rs
++++ b/inferno_aoip/src/protocol/proto_cmc.rs
+@@ -2,6 +2,17 @@ use crate::device_info::DeviceId;
+ 
+ pub const PORT: u16 = 8800;
+ 
++// CMC packets from DC (controller) use start code 0x1000.
++// CMC response packets from devices (including Shure hardware) use 0x1200.
++// DC validates this — echoing the request's 0x1000 back causes DC to reject the response
++// and never send the CMC 0x3010 controller-registration keepalive.
++pub const RESPONSE_START_CODE: u16 = 0x1200;
++
++pub const REQUEST_DEVICE_ADVERTISEMENT: u16 = 0x1001;
++// Sent by DC to devices it considers fully manageable; device echoes it back.
++// This bidirectional exchange is what enables management buttons in DC Device Config.
++pub const REGISTER_CONTROLLER: u16 = 0x3010;
++
+ #[derive(Debug, binary_serde::BinarySerde, Default)]
+ pub struct DeviceAdvertisement {
+   pub process_id: u16,
+@@ -12,5 +23,3 @@ pub struct DeviceAdvertisement {
+   pub info_request_port: u16,
+   pub unknown3_0: u16,
+ }
+-
+-pub const REQUEST_DEVICE_ADVERTISEMENT: u16 = 0x1001;
+diff --git a/inferno_aoip/src/protocol/req_resp.rs b/inferno_aoip/src/protocol/req_resp.rs
+index 68787fe..a72c184 100644
+--- a/inferno_aoip/src/protocol/req_resp.rs
++++ b/inferno_aoip/src/protocol/req_resp.rs
+@@ -104,7 +104,14 @@ impl Connection {
+     let rem = self.remote.as_ref().unwrap();
+     self.send(rem.addr, rem.start_code, rem.seqnum, rem.opcode1, opcode2, content).await;
+   }
++  pub async fn respond_with_code_start(&mut self, start_code: u16, opcode2: u16, content: &[u8]) {
++    let rem = self.remote.as_ref().unwrap().clone();
++    self.send(rem.addr, start_code, rem.seqnum, rem.opcode1, opcode2, content).await;
++  }
+   pub async fn respond_with_struct(&mut self, code: u16, payload: impl BinarySerde) {
+     self.respond_with_code(code, payload.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice()).await;
+   }
++  pub async fn respond_with_struct_start(&mut self, start_code: u16, code: u16, payload: impl BinarySerde) {
++    self.respond_with_code_start(start_code, code, payload.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice()).await;
++  }
+ }
+-- 
+2.43.0
+

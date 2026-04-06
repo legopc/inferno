@@ -1,1 +1,7 @@
 /target
+
+# Large packet captures — store locally only
+captures/
+*.pcap
+*.pcap.gz
+*.pcapng

@@ -1,0 +1,43 @@
+From 84fe1a5d8c39a6399ded21fff1751f3019168bd1 Mon Sep 17 00:00:00 2001
+From: Jelle Jassies <jellejassies@outlook.com>
+Date: Sun, 5 Apr 2026 23:57:39 +0000
+Subject: [PATCH 3/6] fix: enable sample rate/encoding display in DC
+ (content[0x17] = 0x18)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Set feature flags byte to 0x18 (Identify=0x08 + SampleRate/Encoding=0x10).
+With 0x00, DC says 'not supported' and never queries these values.
+Omit Reboot (0x40) and Factory Reset (0x80) — not implemented.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ inferno_aoip/src/device_server/info_mcast_server.rs | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/inferno_aoip/src/device_server/info_mcast_server.rs b/inferno_aoip/src/device_server/info_mcast_server.rs
+index bf9f103..9197348 100644
+--- a/inferno_aoip/src/device_server/info_mcast_server.rs
++++ b/inferno_aoip/src/device_server/info_mcast_server.rs
+@@ -135,11 +135,15 @@ impl<'s> Multicaster<'s> {
+     // 0x16:
+     //       0x10 - has Manufacturer name
+     //       0x40 - Network is configurable (supports static addressing)
+-    // 0x17: Identify device, Sample rate & encoding configuration, Reboot, Factory reset (was 0xdb)
++    // 0x17: feature flags:
++    //   0x08 = Identify device (LED blink)
++    //   0x10 = Sample rate & encoding (enables DC to query/display these values)
++    //   0x40 = Reboot (omitted — not implemented)
++    //   0x80 = Factory reset (omitted — not implemented)
+     content[0x14] = 0;
+     content[0x15] = 0;
+     content[0x16] = 0x10;
+-    content[0x17] = 0;
++    content[0x17] = 0x18; // Identify + Sample rate & encoding display
+ 
+     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
+                           /* content[0xbf] = 5;
+-- 
+2.43.0
+

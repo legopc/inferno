@@ -1,0 +1,51 @@
+From b6f483c64f1250f588893913be6924c176ece0cb Mon Sep 17 00:00:00 2001
+From: Jelle Jassies <jellejassies@outlook.com>
+Date: Mon, 6 Apr 2026 18:32:17 +0000
+Subject: [PATCH] T3.4: handle DC reboot command (conmon 0x073d/0x0090)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When Dante Controller sends a reboot command (conmon outer opcode 0x073d,
+inner type 0x0090) to our info_request_port, ack with 0x0092 to
+224.0.0.231:8702 and exit. systemd Restart=on-failure relaunches the service.
+
+Also silence DC periodic heartbeat queries (0x073d/0x1008) — previously
+logged as unknown warnings; now handled at trace level.
+
+Protocol decoded from dante7.pcapng capture at 06:47:47.630706 UTC.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../src/device_server/info_mcast_server.rs        | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/inferno_aoip/src/device_server/info_mcast_server.rs b/inferno_aoip/src/device_server/info_mcast_server.rs
+index a8d41fb..058edf5 100644
+--- a/inferno_aoip/src/device_server/info_mcast_server.rs
++++ b/inferno_aoip/src/device_server/info_mcast_server.rs
+@@ -531,6 +531,21 @@ pub async fn run_server(
+           [0x07, _, 0, 0x83, 0, 0, 0, _] => {
+             mcaster.send_encoding().await;
+           }
++          [0x07, _, 0, 0x90, 0, 0, 0, _] => {
++            // Reboot command from Dante Controller (conmon message_type=0x0090).
++            // Ack with 0x0092 to 224.0.0.231:8702 so DC knows the command was received,
++            // then exit — systemd Restart=on-failure will re-launch the service.
++            warn!("Reboot requested by Dante Controller — restarting");
++            mcaster.send(
++              mcaster.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x92, 0, 0, 0, 0],
++              &[]
++            ).await;
++            std::process::exit(0);
++          }
++          [0x07, _, 0x10, 0x08, 0, 0, 0, _] => {
++            // DC periodic heartbeat query — normal traffic, no response needed
++            trace!("DC heartbeat query received");
++          }
+           _ => {
+             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));
+             warn!("raw udp payload: {}", hex::encode(request_buf));
+-- 
+2.43.0
+

@@ -1,0 +1,286 @@
+From 374896952ab6dd210acd62e60ca78373114f351e Mon Sep 17 00:00:00 2001
+From: Jelle Jassies <jellejassies@outlook.com>
+Date: Mon, 6 Apr 2026 04:52:35 +0000
+Subject: [PATCH] feat: T1.3-T1.10 + T2.7 DC integration improvements
+
+T1.3: send_sample_rate() uses self_info.sample_rate (was hardcoded 48000)
+T1.4: send_encoding() uses self_info.bits_per_sample; BITS_PER_SAMPLE env var
+T1.5: firmware_version_bytes derived from Cargo macros, used in send_board_info()
+T1.6: Uncomment rate-limit fields in send_board_info() (0xbf=5, 0xc3=3, 0xc7=3)
+T1.7: Uncomment product version write at 0x12c in send_product_info()
+T1.8: Add tx_latency_ns to DeviceInfo; fix mDNS TX channel/bundle latency_ns records
+T1.9: Lower cmcp_vers from 1.2.0 to 1.0.0 (only CMCPv1.0 opcodes implemented)
+T1.10: Uncomment real 0x1102 property schema response in arc_server
+T2.7: Rate-limit clock-unavailable error logs to once per 30s in flows_tx
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ inferno_aoip/src/device_info.rs               |  1 +
+ inferno_aoip/src/device_server/arc_server.rs  |  8 ++--
+ inferno_aoip/src/device_server/flows_tx.rs    | 23 ++++++++---
+ .../src/device_server/info_mcast_server.rs    | 39 +++++++++++--------
+ inferno_aoip/src/device_server/mdns_server.rs |  6 +--
+ inferno_aoip/src/device_server/settings.rs    |  9 ++++-
+ 6 files changed, 56 insertions(+), 30 deletions(-)
+
+diff --git a/inferno_aoip/src/device_info.rs b/inferno_aoip/src/device_info.rs
+index 8be2bb1..a4592ec 100644
+--- a/inferno_aoip/src/device_info.rs
++++ b/inferno_aoip/src/device_info.rs
+@@ -36,6 +36,7 @@ pub struct DeviceInfo {
+   pub bits_per_sample: u8,
+   pub pcm_type: u8, // usually 0xe, in older devices 4
+   pub latency_ns: usize,
++  pub tx_latency_ns: usize, // T1.8: TX latency separate from RX, used by mDNS TX channel/bundle records
+   pub sample_rate: u32,
+ 
+   pub arc_port: u16,
+diff --git a/inferno_aoip/src/device_server/arc_server.rs b/inferno_aoip/src/device_server/arc_server.rs
+index bed3856..192f0bb 100644
+--- a/inferno_aoip/src/device_server/arc_server.rs
++++ b/inferno_aoip/src/device_server/arc_server.rs
+@@ -539,10 +539,8 @@ pub async fn run_server(
+           conn.respond(&content).await;
+         }
+         0x1102 => {
+-          // identical for all low channels count devices
+-          let content = [0u8; 94];
+-          // XXX not necessary
+-          /* let content = [
++          // property schema — static for low channel-count devices
++          let content = [
+             /* number of items, 2B: */ 0x00, 0x17, 0x80, 0x20, 0x00, 0x01,
+             0x80, 0x21, 0x00, 0x03, 0x00, 0x22, 0x00, 0x03, 0x00, 0x23, 0x00, 0x03, 0x00, 0x24, 0x00, 0x01,
+             0x02, 0x01, 0x00, 0x03, 0x82, 0x04, 0x00, 0x03, 0x82, 0x05, 0x00, 0x03, 0x02, 0x0a, 0x00, 0x01,
+@@ -550,7 +548,7 @@ pub async fn run_server(
+             0x02, 0x13, 0x00, 0x01, 0x02, 0x14, 0x00, 0x01, 0x83, 0x01, 0x00, 0x03, 0x83, 0x06, 0x00, 0x01,
+             0x83, 0x02, 0x00, 0x01, 0x03, 0x10, 0x00, 0x01, 0x03, 0x11, 0x00, 0x01, 0x03, 0x03, 0x00, 0x03,
+             0x83, 0xf0, 0x00, 0x01, 0x06, 0x01, 0x00, 0x01
+-          ]; */
++          ];
+           conn.respond(&content).await;
+         }
+         0x3300 => {
+diff --git a/inferno_aoip/src/device_server/flows_tx.rs b/inferno_aoip/src/device_server/flows_tx.rs
+index b289a11..b79fe4c 100644
+--- a/inferno_aoip/src/device_server/flows_tx.rs
++++ b/inferno_aoip/src/device_server/flows_tx.rs
+@@ -3,7 +3,7 @@ use std::num::Wrapping;
+ use std::sync::atomic::{AtomicBool, AtomicUsize};
+ use std::sync::{Arc, RwLock};
+ use std::thread::JoinHandle;
+-use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::{AtomicU32, AtomicU64}, time::Duration};
++use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::{AtomicU32, AtomicU64}, time::{Duration, Instant}};
+ 
+ use atomic::Ordering;
+ use futures::FutureExt;
+@@ -217,6 +217,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
+     let sample_rate = self.sample_rate;
+     let process_events_interval = (sample_rate / 30) as Clock;
+     let mut dither_rng = SmallRng::from_rng(rand::thread_rng()).unwrap();
++    let mut last_clock_error_log = Instant::now() - Duration::from_secs(31);
+ 
+     if let Some(rx) = &mut start_time_rx {
+       match rx.await {
+@@ -249,7 +250,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
+       if let Some(now) = now_opt {
+         break now;
+       } else {
+-        error!("clock unavailable, can't transmit. is the PTP daemon running? (@init)");
++        if last_clock_error_log.elapsed() >= Duration::from_secs(30) {
++          error!("clock unavailable, can't transmit. is the PTP daemon running?");
++          last_clock_error_log = Instant::now();
++        }
+         tokio::time::sleep(Duration::from_secs(1)).await;
+       }
+     };
+@@ -281,7 +285,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
+       let now = if let Some(now) = self.now() {
+         now
+       } else {
+-        error!("clock unavailable, can't transmit. is the PTP daemon running? (@get now)");
++        if last_clock_error_log.elapsed() >= Duration::from_secs(30) {
++          error!("clock unavailable, can't transmit. is the PTP daemon running?");
++          last_clock_error_log = Instant::now();
++        }
+         tokio::time::sleep(Duration::from_secs(1)).await;
+         continue;
+       };
+@@ -314,7 +321,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
+             Command::NoOp
+           }
+         } else {
+-          error!("clock unavailable, can't transmit. is the PTP daemon running? (@non-select)");
++          if last_clock_error_log.elapsed() >= Duration::from_secs(30) {
++            error!("clock unavailable, can't transmit. is the PTP daemon running?");
++            last_clock_error_log = Instant::now();
++          }
+           self.commands_receiver.try_recv().unwrap_or(Command::NoOp)
+         }
+       } else {
+@@ -331,7 +341,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
+             if let Some(now) = self.now() {
+               self.transmit(&mut dither_rng, now, true);
+             } else {
+-              error!("clock unavailable, can't transmit. is the PTP daemon running? (@select)");
++              if last_clock_error_log.elapsed() >= Duration::from_secs(30) {
++                error!("clock unavailable, can't transmit. is the PTP daemon running?");
++                last_clock_error_log = Instant::now();
++              }
+             }
+             Command::NoOp
+           }
+diff --git a/inferno_aoip/src/device_server/info_mcast_server.rs b/inferno_aoip/src/device_server/info_mcast_server.rs
+index 99975cc..b575c2f 100644
+--- a/inferno_aoip/src/device_server/info_mcast_server.rs
++++ b/inferno_aoip/src/device_server/info_mcast_server.rs
+@@ -66,7 +66,12 @@ impl<'s> Multicaster<'s> {
+       server,
+       seqnum: 1,
+       vendor: [32; 8],
+-      firmware_version_bytes: [4, 1, 6, 2],
++      firmware_version_bytes: [
++        env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(), // T1.5: derive from Cargo version like product_version_bytes
++        env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
++        H(patch_version),
++        L(patch_version),
++      ],
+       product_version_bytes: [
+         env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
+         env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
+@@ -118,7 +123,7 @@ impl<'s> Multicaster<'s> {
+   async fn send_board_info(&mut self) {
+     let mut content = [0u8; 200];
+     // Firmware version:
+-    content[0..4].copy_from_slice(&[4, 1, 0, 6]);
++    content[0..4].copy_from_slice(&self.firmware_version_bytes); // T1.5: use struct field instead of hardcoded literal
+     content[0x23] = 2;
+     // Hardware version:
+     content[4..8].copy_from_slice(&[4, 1, 0, 3]);
+@@ -146,9 +151,9 @@ impl<'s> Multicaster<'s> {
+     content[0x17] = 0x08; // Identify only — bit 0x10 would make DC show rate/encoding as editable
+ 
+     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
+-                          /* content[0xbf] = 5;
+-                          content[0xc3] = 3;
+-                          content[0xc7] = 3; */
++    content[0xbf] = 5;   // T1.6: limit DC polling rate for board-info sub-types (matches reference capture)
++    content[0xc3] = 3;   // T1.6: rate limit sub-type 3
++    content[0xc7] = 3;   // T1.6: rate limit sub-type 7
+     write_str_to_buffer(&mut content, 12, 8, &self.self_info.board_name);
+     write_str_to_buffer(&mut content, 0x38, 16, &self.self_info.board_name);
+ 
+@@ -162,7 +167,7 @@ impl<'s> Multicaster<'s> {
+     write_str_to_buffer(&mut content, 0x2c, 16, &self.self_info.manufacturer);
+     write_str_to_buffer(&mut content, 0xac, 16, &self.self_info.model_name);
+     // product version:
+-    //content[0x12c..0x130].copy_from_slice(&self.product_version_bytes);
++    content[0x12c..0x130].copy_from_slice(&self.product_version_bytes); // T1.7: populate product version field (same as firmware at 0x1c)
+ 
+     // firmware version:
+     content[0x1c..0x20].copy_from_slice(&self.product_version_bytes);
+@@ -396,7 +401,8 @@ impl<'s> Multicaster<'s> {
+   }
+ 
+   async fn send_sample_rate(&mut self) {
+-    // Advertise only 48000 Hz as the single supported rate so DC shows it read-only.
++    // Advertise the configured sample rate as the single supported rate so DC shows it read-only.
++    let sr = (self.self_info.sample_rate as u16).to_be_bytes(); // T1.3: use actual rate, not hardcoded 48000
+     self
+       .send(
+         self.device_info_destination,
+@@ -406,17 +412,18 @@ impl<'s> Multicaster<'s> {
+           // Header matches Shure MXWANI8 exactly: 0x0018=length, 0x0001=type.
+           // Using 0x0004 as type makes DC treat the rate as editable.
+           0x00, 0x18, 0x00, 0x01,
+-          0x00, 0x00, 0xbb, 0x80, // current sample rate: 48000
+-          0x00, 0x00, 0xbb, 0x80, // default sample rate: 48000
+-          0x00, 0x01, 0x00, 0x00, // 1 supported rate
+-          0x00, 0x00, 0xbb, 0x80, // 48000
++          0x00, 0x00, sr[0], sr[1], // current sample rate: from self_info
++          0x00, 0x00, sr[0], sr[1], // default sample rate: from self_info
++          0x00, 0x01, 0x00, 0x00,   // 1 supported rate
++          0x00, 0x00, sr[0], sr[1], // single supported rate: from self_info
+         ],
+       )
+       .await;
+   }
+ 
+   async fn send_encoding(&mut self) {
+-    // Advertise only 24-bit as the single supported encoding so DC shows it read-only.
++    // Advertise the configured encoding as the single supported encoding so DC shows it read-only.
++    let bps = (self.self_info.bits_per_sample as u32).to_be_bytes(); // T1.4: use actual bits_per_sample, not hardcoded 0x18
+     self
+       .send(
+         self.device_info_destination,
+@@ -425,10 +432,10 @@ impl<'s> Multicaster<'s> {
+         &[
+           // Use 0x0018/0x0003 to match the non-editable pattern (Shure uses 0x0018/0x0001 for 0x80).
+           0x00, 0x18, 0x00, 0x03,
+-          0x00, 0x00, 0x00, 0x18, // current encoding: 24-bit (0x18)
+-          0x00, 0x00, 0x00, 0x18, // default encoding: 24-bit
+-          0x00, 0x01, 0x00, 0x00, // 1 supported encoding
+-          0x00, 0x00, 0x00, 0x18, // 24-bit
++          bps[0], bps[1], bps[2], bps[3], // current encoding: bits_per_sample
++          bps[0], bps[1], bps[2], bps[3], // default encoding: bits_per_sample
++          0x00, 0x01, 0x00, 0x00,          // 1 supported encoding
++          bps[0], bps[1], bps[2], bps[3], // single supported encoding: bits_per_sample
+         ],
+       )
+       .await;
+diff --git a/inferno_aoip/src/device_server/mdns_server.rs b/inferno_aoip/src/device_server/mdns_server.rs
+index d7bbe90..12489e2 100644
+--- a/inferno_aoip/src/device_server/mdns_server.rs
++++ b/inferno_aoip/src/device_server/mdns_server.rs
+@@ -60,7 +60,7 @@ impl DeviceMDNSResponder {
+           .add_ip_address(IpAddr::V4(self_info.ip_address))
+           .add_txt_truncated(kv("id", &hex::encode(self_info.factory_device_id)))
+           .add_txt_truncated(kv("process", self_info.process_id))
+-          .add_txt_truncated("cmcp_vers=1.2.0")
++          .add_txt_truncated("cmcp_vers=1.0.0") // T1.9: only CMCPv1.0 opcodes implemented; 1.2.0 overstates
+           .add_txt_truncated("cmcp_min=1.0.0")
+           .add_txt_truncated("server_vers=4.0.2")
+           .add_txt_truncated("channels=0x6000004d") // ???
+@@ -101,7 +101,7 @@ impl DeviceMDNSResponder {
+         .add_txt_truncated(format!("pcm={} {:x}", self_info.bits_per_sample / 8, self_info.pcm_type))
+         .add_txt_truncated(kv("enc", self_info.bits_per_sample))
+         .add_txt_truncated(kv("en", self_info.bits_per_sample))
+-        .add_txt_truncated(kv("latency_ns", self_info.latency_ns /* FIXME should be tx latency */))
++        .add_txt_truncated(kv("latency_ns", self_info.tx_latency_ns)) // T1.8: use TX latency, not RX
+         .add_txt_truncated(format!("fpp={},{}", FPP_MAX_ADVERTISED, FPP_MIN))
+         .add_txt_truncated(kv("nchan", MAX_CHANNELS_IN_FLOW.min(self_info.tx_channels.len() as u16)));
+       if default {
+@@ -163,7 +163,7 @@ impl DeviceMDNSResponder {
+       .add_txt_truncated("txtvers=1")
+       .add_txt_truncated(kv("id", bundle_id))
+       .add_txt_truncated(kv("nchan", channels_per_flow))
+-      .add_txt_truncated(kv("latency_ns", self_info.latency_ns /* FIXME should be tx latency */))
++      .add_txt_truncated(kv("latency_ns", self_info.tx_latency_ns)) // T1.8: use TX latency, not RX
+       .add_txt_truncated(kv("fpp", fpp))
+       .add_txt_truncated(kv("rate", self_info.sample_rate))
+       .add_txt_truncated(kv("enc", self_info.bits_per_sample))
+diff --git a/inferno_aoip/src/device_server/settings.rs b/inferno_aoip/src/device_server/settings.rs
+index 55c3e44..ad893cb 100644
+--- a/inferno_aoip/src/device_server/settings.rs
++++ b/inferno_aoip/src/device_server/settings.rs
+@@ -124,9 +124,16 @@ fn create_self_info(
+     model_number: "_000000000000000b".to_owned(),
+     rx_channels: vec![],
+     tx_channels: vec![],
+-    bits_per_sample: 24, // TODO make it configurable
++    bits_per_sample: settings
++      .get("BITS_PER_SAMPLE")
++      .map(|s| s.parse::<u8>().expect("invalid BITS_PER_SAMPLE, must be integer"))
++      .unwrap_or(24), // T1.4: read from INFERNO_BITS_PER_SAMPLE env var, default 24
+     pcm_type: 0xe,
+     latency_ns,
++    tx_latency_ns: settings
++      .get("TX_LATENCY_NS")
++      .map(|s| s.parse().expect("invalid TX_LATENCY_NS, must be integer"))
++      .unwrap_or(10_000_000), // T1.8: TX latency for mDNS channel/bundle records
+     sample_rate,
+ 
+     arc_port: ARC_PORT,
+-- 
+2.43.0
+

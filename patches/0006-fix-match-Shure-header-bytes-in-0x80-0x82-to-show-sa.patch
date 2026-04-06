@@ -1,0 +1,53 @@
+From 895ec46341b53ffc2b4e924b568b152730ff6e44 Mon Sep 17 00:00:00 2001
+From: Jelle Jassies <jellejassies@outlook.com>
+Date: Mon, 6 Apr 2026 01:37:50 +0000
+Subject: [PATCH 6/6] fix: match Shure header bytes in 0x80/0x82 to show sample
+ rate/encoding read-only
+
+- Change 0x80 header from 00 10 00 04 to 00 18 00 01 (exact Shure wire format)
+- Change 0x82 header from 00 10 00 03 to 00 18 00 03 (same length field)
+- Remove feature flag bit 0x10 from content[0x17] (was making DC treat rate as configurable)
+- Shure MXWANI8 capture confirms: 00 18 00 01 + no bit 0x10 = display-only in DC
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ inferno_aoip/src/device_server/info_mcast_server.rs | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/inferno_aoip/src/device_server/info_mcast_server.rs b/inferno_aoip/src/device_server/info_mcast_server.rs
+index 71b25a1..99975cc 100644
+--- a/inferno_aoip/src/device_server/info_mcast_server.rs
++++ b/inferno_aoip/src/device_server/info_mcast_server.rs
+@@ -143,7 +143,7 @@ impl<'s> Multicaster<'s> {
+     content[0x14] = 0;
+     content[0x15] = 0;
+     content[0x16] = 0x10;
+-    content[0x17] = 0x18; // Identify + Sample rate & encoding display
++    content[0x17] = 0x08; // Identify only — bit 0x10 would make DC show rate/encoding as editable
+ 
+     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
+                           /* content[0xbf] = 5;
+@@ -403,7 +403,9 @@ impl<'s> Multicaster<'s> {
+         0xffff,
+         [0x07, 0x2a, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00],
+         &[
+-          0x00, 0x10, 0x00, 0x04,
++          // Header matches Shure MXWANI8 exactly: 0x0018=length, 0x0001=type.
++          // Using 0x0004 as type makes DC treat the rate as editable.
++          0x00, 0x18, 0x00, 0x01,
+           0x00, 0x00, 0xbb, 0x80, // current sample rate: 48000
+           0x00, 0x00, 0xbb, 0x80, // default sample rate: 48000
+           0x00, 0x01, 0x00, 0x00, // 1 supported rate
+@@ -421,7 +423,8 @@ impl<'s> Multicaster<'s> {
+         0xffff,
+         [0x07, 0x2a, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00],
+         &[
+-          0x00, 0x10, 0x00, 0x03,
++          // Use 0x0018/0x0003 to match the non-editable pattern (Shure uses 0x0018/0x0001 for 0x80).
++          0x00, 0x18, 0x00, 0x03,
+           0x00, 0x00, 0x00, 0x18, // current encoding: 24-bit (0x18)
+           0x00, 0x00, 0x00, 0x18, // default encoding: 24-bit
+           0x00, 0x01, 0x00, 0x00, // 1 supported encoding
+-- 
+2.43.0
+

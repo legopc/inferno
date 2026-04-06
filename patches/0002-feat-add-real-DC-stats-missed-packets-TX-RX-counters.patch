@@ -1,0 +1,561 @@
+From ef1136f2a4a709b5cbc3d5f8f12064adb4039f23 Mon Sep 17 00:00:00 2001
+From: Jelle Jassies <jellejassies@outlook.com>
+Date: Sun, 5 Apr 2026 23:23:26 +0000
+Subject: [PATCH 2/6] feat: add real DC stats - missed packets, TX/RX counters,
+ sample rate/encoding responses
+
+- Track late/missed packets per RX flow (latency > budget) via AtomicU32
+  in SocketData/FlowInfo; report real counts in 0x8004 heartbeat block
+- Track TX/RX byte counts (AtomicU64) and error counts (AtomicU32) in
+  FlowsTransmitter/FlowsReceiver; report bytes/sec in 0x8000 utilization block
+- Wire all 4 counter Arcs through DeviceServer -> info_mcast_server,
+  FlowsReceiver::start(), FlowsTransmitter::start()
+- Add send_sample_rate(): responds to DC opcode 0x81 with 44100/48000/88200/96000
+- Add send_encoding(): responds to DC opcode 0x83 with 16/24/32-bit depth entries
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ inferno_aoip/src/device_server/flows_rx.rs    | 58 ++++++++++---
+ inferno_aoip/src/device_server/flows_tx.rs    | 52 ++++++++----
+ .../src/device_server/info_mcast_server.rs    | 82 +++++++++++++++++--
+ inferno_aoip/src/device_server/mod.rs         | 24 +++++-
+ 4 files changed, 176 insertions(+), 40 deletions(-)
+
+diff --git a/inferno_aoip/src/device_server/flows_rx.rs b/inferno_aoip/src/device_server/flows_rx.rs
+index 91c3a56..d6930f3 100644
+--- a/inferno_aoip/src/device_server/flows_rx.rs
++++ b/inferno_aoip/src/device_server/flows_rx.rs
+@@ -9,7 +9,7 @@ use crate::{common::*, media_clock::MediaClock};
+ 
+ use std::io::ErrorKind::WouldBlock;
+ use std::net::SocketAddr;
+-use std::sync::atomic::{AtomicI32, AtomicUsize};
++use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize};
+ use std::sync::{Arc, RwLock};
+ use std::thread::JoinHandle;
+ use std::time::{Duration, Instant};
+@@ -49,6 +49,7 @@ struct SocketData<P: ProxyToSamplesBuffer> {
+   channels: Vec<Option<Channel<P>>>,
+   empty_sinks_vecs: Vec<Vec<RBInput<Sample, P>>>,
+   actual_latency_samples: Arc<AtomicI32>,
++  missed_packets: Arc<AtomicU32>,
+ }
+ 
+ struct SilenceWriter<P: ProxyToSamplesBuffer> {
+@@ -89,6 +90,8 @@ struct FlowsReceiverInternal<P: ProxyToSamplesBuffer> {
+   ref_instant: Instant,
+   on_transfer: Option<TransferNotifier>,
+   current_timestamp: Arc<AtomicUsize>,
++  rx_bytes: Arc<AtomicU64>,
++  rx_errors: Arc<AtomicU32>,
+ }
+ 
+ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
+@@ -99,6 +102,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
+     clock: &mut MediaClock,
+     ref_instant: Instant,
+     write: bool,
++    rx_bytes: &Arc<AtomicU64>,
++    rx_errors: &Arc<AtomicU32>,
+   ) -> Command<P> {
+     let mut buf = [0; MTU];
+     loop {
+@@ -106,8 +111,10 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
+         Ok((recv_size, src)) => {
+           if recv_size < 9 {
+             error!("received corrupted (too small) packet on flow socket");
++            rx_errors.fetch_add(1, Ordering::Relaxed);
+             return Command::NoOp;
+           }
++          rx_bytes.fetch_add(recv_size as u64, Ordering::Relaxed);
+           let timestamp = (u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize)
+             .wrapping_mul(sample_rate as usize)
+             .wrapping_add(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize)
+@@ -121,6 +128,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
+           if let Some(now) = clock.wrapping_now_in_timebase(sample_rate.into()) {
+             let latency = wrapped_diff(now, timestamp).clamp(0, i32::MAX as _);
+             sd.actual_latency_samples.fetch_max(latency as _, Ordering::Relaxed);
++            if latency > sd.latency_samples as isize {
++              sd.missed_packets.fetch_add(1, Ordering::Relaxed);
++            }
+           }
+ 
+           if write {
+@@ -254,6 +264,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
+               &mut self.clock,
+               self.ref_instant,
+               start_time_rx.is_none(),
++              &self.rx_bytes,
++              &self.rx_errors,
+             );
+           } else {
+             warn!("got token not bound to any existing socket");
+@@ -449,6 +461,7 @@ pub struct FlowInfo {
+   pub channels_map: Vec<BoolVec>,
+   pub latency_samples: u32,
+   pub actual_latency_samples: Arc<AtomicI32>,
++  pub missed_packets: Arc<AtomicU32>,
+ }
+ 
+ pub struct FlowsReceiver<P: ProxyToSamplesBuffer> {
+@@ -456,6 +469,8 @@ pub struct FlowsReceiver<P: ProxyToSamplesBuffer> {
+   waker: mio::Waker,
+   max_channels: usize,
+   pub flows_info: Arc<RwLock<Vec<Option<FlowInfo>>>>,
++  pub rx_bytes: Arc<AtomicU64>,
++  pub rx_errors: Arc<AtomicU32>,
+ }
+ 
+ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+@@ -469,6 +484,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+     on_transfer: Option<TransferNotifier>,
+     current_timestamp: Arc<AtomicUsize>,
+     max_channels: usize,
++    rx_bytes: Arc<AtomicU64>,
++    rx_errors: Arc<AtomicU32>,
+   ) {
+     let mut internal = FlowsReceiverInternal {
+       commands_receiver: rx,
+@@ -481,6 +498,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+       ref_instant,
+       on_transfer,
+       current_timestamp,
++      rx_bytes,
++      rx_errors,
+     };
+     internal.run(start_time_rx);
+   }
+@@ -491,6 +510,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
+     current_timestamp: Arc<AtomicUsize>,
+     on_transfer: Option<TransferNotifier>,
++    rx_bytes: Arc<AtomicU64>,
++    rx_errors: Arc<AtomicU32>,
+   ) -> (Self, JoinHandle<()>) {
+     let (tx, rx) = mpsc::channel(100);
+     let poll = mio::Poll::new().unwrap();
+@@ -499,18 +520,24 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+     let max_channels = self_info.rx_channels.len();
+     let thread_join = std::thread::Builder::new()
+       .name("flows RX".to_owned())
+-      .spawn(move || {
+-        Self::run(
+-          rx,
+-          poll,
+-          srate,
+-          ref_instant,
+-          clock_recv,
+-          start_time_rx,
+-          on_transfer,
+-          current_timestamp,
+-          max_channels,
+-        );
++      .spawn({
++        let rx_bytes = rx_bytes.clone();
++        let rx_errors = rx_errors.clone();
++        move || {
++          Self::run(
++            rx,
++            poll,
++            srate,
++            ref_instant,
++            clock_recv,
++            start_time_rx,
++            on_transfer,
++            current_timestamp,
++            max_channels,
++            rx_bytes,
++            rx_errors,
++          );
++        }
+       })
+       .unwrap();
+     return (
+@@ -519,6 +546,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+         waker,
+         max_channels,
+         flows_info: Arc::new(RwLock::new((0..MAX_FLOWS).map(|_| None).collect_vec())),
++        rx_bytes,
++        rx_errors,
+       },
+       thread_join,
+     );
+@@ -548,11 +577,13 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+       .collect_vec();
+     let port = socket.local_addr().unwrap().port();
+     let als: Arc<AtomicI32> = Arc::new(0.into());
++    let mp: Arc<AtomicU32> = Arc::new(0.into());
+     self.flows_info.write().unwrap()[local_index] = Some(FlowInfo {
+       rx_port: port,
+       channels_map: (0..channels_count).map(|_| boolvec![false; self.max_channels]).collect(),
+       latency_samples: latency_samples.try_into().unwrap(),
+       actual_latency_samples: als.clone(),
++      missed_packets: mp.clone(),
+     });
+     self
+       .commands_sender
+@@ -568,6 +599,7 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+           channels: (0..channels_count).map(|_| None).collect(),
+           empty_sinks_vecs,
+           actual_latency_samples: als,
++          missed_packets: mp,
+         },
+       })
+       .await
+diff --git a/inferno_aoip/src/device_server/flows_tx.rs b/inferno_aoip/src/device_server/flows_tx.rs
+index bfc8c38..b289a11 100644
+--- a/inferno_aoip/src/device_server/flows_tx.rs
++++ b/inferno_aoip/src/device_server/flows_tx.rs
+@@ -3,7 +3,7 @@ use std::num::Wrapping;
+ use std::sync::atomic::{AtomicBool, AtomicUsize};
+ use std::sync::{Arc, RwLock};
+ use std::thread::JoinHandle;
+-use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::AtomicU32, time::Duration};
++use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::{AtomicU32, AtomicU64}, time::Duration};
+ 
+ use atomic::Ordering;
+ use futures::FutureExt;
+@@ -103,6 +103,8 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
+   timestamp_shift: ClockDiff,
+   current_timestamp: Arc<AtomicUsize>,
+   on_transfer: Option<TransferNotifier>,
++  tx_bytes: Arc<AtomicU64>,
++  tx_errors: Arc<AtomicU32>,
+   //callback: SamplesRequestCallback,
+ }
+ 
+@@ -179,11 +181,14 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
+         if let Ok(written) = flow.socket.send(&pbuff[0..to_send]) {
+           if written == to_send {
+             flow.next_ts = flow.next_ts.wrapping_add(flow.fpp.try_into().unwrap());
++            self.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
+           } else {
+             warn!("written {written}, should have {to_send}");
++            self.tx_errors.fetch_add(1, Ordering::Relaxed);
+           }
+         } else {
+           warn!("send returned error");
++          self.tx_errors.fetch_add(1, Ordering::Relaxed);
+         }
+         iterations += 1;
+         if (iterations % 16) == 0 {
+@@ -437,6 +442,8 @@ pub struct FlowsTransmitter {
+   ip_port_to_id: BTreeMap<SocketAddr, u32>,
+   commands_sender: mpsc::Sender<Command>,
+   flows_info: Vec<Option<FlowInfo>>,
++  pub tx_bytes: Arc<AtomicU64>,
++  pub tx_errors: Arc<AtomicU32>,
+ }
+ 
+ fn split_handle(h: FlowHandle) -> (u32, u16) {
+@@ -454,6 +461,8 @@ impl FlowsTransmitter {
+     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
+     current_timestamp: Arc<AtomicUsize>,
+     on_transfer: Option<TransferNotifier>,
++    tx_bytes: Arc<AtomicU64>,
++    tx_errors: Arc<AtomicU32>,
+   ) {
+     let latency: u32 = (latency_ns as u64 * sample_rate as u64 / 1_000_000_000u64).try_into().unwrap();
+     let mut internal = FlowsTransmitterInternal {
+@@ -471,6 +480,8 @@ impl FlowsTransmitter {
+         .unwrap(),
+       current_timestamp,
+       on_transfer,
++      tx_bytes,
++      tx_errors,
+     };
+     internal.run(start_time_rx).await;
+   }
+@@ -482,25 +493,32 @@ impl FlowsTransmitter {
+     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
+     current_timestamp: Arc<AtomicUsize>,
+     on_transfer: Option<TransferNotifier>,
++    tx_bytes: Arc<AtomicU64>,
++    tx_errors: Arc<AtomicU32>,
+   ) -> (Self, JoinHandle<()>) {
+     let (tx, rx) = mpsc::channel(100);
+-    let tx1 = tx.clone();
+     let srate = self_info.sample_rate;
+     // TODO dehardcode latency_ns
+-    let thread_join = run_future_in_new_thread("flows TX", move || {
+-      Self::run(
+-        rx,
+-        clock_recv,
+-        srate,
+-        0, /*LATENCY TODO*/
+-        // we set max_lag_samples to tx latency because it doesn't make sense to send samples older than that
+-        (tx_latency_ns as u64 * srate as u64 / 1_000_000_000u64).try_into().unwrap(),
+-        channels_outputs,
+-        start_time_rx,
+-        current_timestamp,
+-        on_transfer,
+-      )
+-      .boxed_local()
++    let thread_join = run_future_in_new_thread("flows TX", {
++      let tx_bytes = tx_bytes.clone();
++      let tx_errors = tx_errors.clone();
++      move || {
++        Self::run(
++          rx,
++          clock_recv,
++          srate,
++          0, /*LATENCY TODO*/
++          // we set max_lag_samples to tx latency because it doesn't make sense to send samples older than that
++          (tx_latency_ns as u64 * srate as u64 / 1_000_000_000u64).try_into().unwrap(),
++          channels_outputs,
++          start_time_rx,
++          current_timestamp,
++          on_transfer,
++          tx_bytes,
++          tx_errors,
++        )
++        .boxed_local()
++      }
+     });
+     return (
+       Self {
+@@ -510,6 +528,8 @@ impl FlowsTransmitter {
+         flows: BTreeMap::new(),
+         ip_port_to_id: BTreeMap::new(),
+         flows_info: (0..MAX_FLOWS).map(|_| None).collect_vec(),
++        tx_bytes,
++        tx_errors,
+       },
+       thread_join,
+     );
+diff --git a/inferno_aoip/src/device_server/info_mcast_server.rs b/inferno_aoip/src/device_server/info_mcast_server.rs
+index 657b8d0..bf9f103 100644
+--- a/inferno_aoip/src/device_server/info_mcast_server.rs
++++ b/inferno_aoip/src/device_server/info_mcast_server.rs
+@@ -6,7 +6,7 @@ use crate::protocol::mcast::{make_packet, MulticastMessage};
+ use crate::media_clock::MediaClock;
+ use crate::{byte_utils::write_str_to_buffer, device_info::DeviceInfo};
+ use bytebuffer::ByteBuffer;
+-use std::sync::atomic::Ordering;
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+ use std::sync::RwLock;
+ use std::{
+   net::{IpAddr, Ipv4Addr, SocketAddr},
+@@ -43,6 +43,10 @@ struct Multicaster<'s> {
+   // Each block group has its own seqnum counter, matching the Shure MXWANI8 pattern.
+   util_block_seqnum: u16,    // for 0x8000+0x8001 packets
+   latency_block_seqnum: u16, // for 0x8003+0x8004 packets
++  tx_bytes: Arc<AtomicU64>,
++  rx_bytes: Arc<AtomicU64>,
++  tx_errors: Arc<AtomicU32>,
++  rx_errors: Arc<AtomicU32>,
+ }
+ 
+ impl<'s> Multicaster<'s> {
+@@ -51,6 +55,10 @@ impl<'s> Multicaster<'s> {
+     server: UdpSocketWrapper,
+     clock: Arc<RwLock<MediaClock>>,
+     get_peaks: PeaksCallback,
++    tx_bytes: Arc<AtomicU64>,
++    rx_bytes: Arc<AtomicU64>,
++    tx_errors: Arc<AtomicU32>,
++    rx_errors: Arc<AtomicU32>,
+   ) -> Multicaster {
+     let patch_version = env!("CARGO_PKG_VERSION_PATCH").parse::<u16>().unwrap();
+     let mut r = Multicaster {
+@@ -79,6 +87,10 @@ impl<'s> Multicaster<'s> {
+       get_peaks,
+       util_block_seqnum: 1,
+       latency_block_seqnum: 1,
++      tx_bytes,
++      rx_bytes,
++      tx_errors,
++      rx_errors,
+     };
+     write_str_to_buffer(&mut r.vendor, 0, 8, &self_info.vendor_string);
+     return r;
+@@ -199,10 +211,10 @@ impl<'s> Multicaster<'s> {
+         bytes.write_u16(0x0000);
+         bytes.write_u16(0x0001);
+         bytes.write_u16(0x0010);
+-        bytes.write_u32(0); // TX bytes/sec
+-        bytes.write_u32(0); // RX bytes/sec
+-        bytes.write_u32(0); // TX errors
+-        bytes.write_u32(0); // RX errors
++        bytes.write_u32(self.tx_bytes.swap(0, Ordering::Relaxed).min(u32::MAX as u64) as u32); // TX bytes/sec
++        bytes.write_u32(self.rx_bytes.swap(0, Ordering::Relaxed).min(u32::MAX as u64) as u32); // RX bytes/sec
++        bytes.write_u32(self.tx_errors.swap(0, Ordering::Relaxed)); // TX errors
++        bytes.write_u32(self.rx_errors.swap(0, Ordering::Relaxed)); // RX errors
+ 
+         bytes.write_u16(16);
+         bytes.write_u16(0x8001);
+@@ -255,8 +267,12 @@ impl<'s> Multicaster<'s> {
+           bytes.write_u16(0);
+           bytes.write_u16(20);
+           bytes.write_u16(0);
+-          for _ in 0..flows_count {
+-            bytes.write_u32(0);
++          for opt in flows_info.iter() {
++            let missed = opt
++              .as_ref()
++              .map(|fi| fi.missed_packets.swap(0, Ordering::Relaxed))
++              .unwrap_or(0);
++            bytes.write_u32(missed);
+           }
+           // lock guard dropped here, before the await
+           bytes.as_bytes().to_vec()
+@@ -374,6 +390,46 @@ impl<'s> Multicaster<'s> {
+       )
+       .await;
+   }
++
++  async fn send_sample_rate(&mut self) {
++    self
++      .send(
++        self.device_info_destination,
++        0xffff,
++        [0x07, 0x2a, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00],
++        &[
++          0x00, 0x18, 0x00, 0x04,
++          0x00, 0x00, 0xbb, 0x80, // current sample rate: 48000
++          0x00, 0x00, 0xbb, 0x80,
++          0x00, 0x02, 0x00, 0x00, // 2 supported rates listed
++          0x00, 0x00,
++          0xac, 0x44,             // 44100
++          0x00, 0x00, 0xbb, 0x80, // 48000
++          0x00, 0x01, 0x58, 0x88, // 88200
++          0x00, 0x01, 0x77, 0x00, // 96000
++        ],
++      )
++      .await;
++  }
++
++  async fn send_encoding(&mut self) {
++    self
++      .send(
++        self.device_info_destination,
++        0xffff,
++        [0x07, 0x2a, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00],
++        &[
++          0x00, 0x18, 0x00, 0x03,
++          0x00, 0x00, 0x00, 0x18, // current encoding: 24-bit (0x18)
++          0x00, 0x00, 0x00, 0x18,
++          0x00, 0x02, 0x00, 0x00, // 2 supported encodings
++          0x00, 0x00, 0x00, 0x18, // 24-bit
++          0x00, 0x00, 0x00, 0x10, // 16-bit
++          0x00, 0x00, 0x00, 0x20, // 32-bit
++        ],
++      )
++      .await;
++  }
+ }
+ 
+ pub async fn run_server(
+@@ -383,11 +439,15 @@ pub async fn run_server(
+   mut channels_sub_rx: watch::Receiver<Option<Arc<ChannelsSubscriber>>>,
+   get_peaks: PeaksCallback,
+   shutdown: BroadcastReceiver<()>,
++  tx_bytes: Arc<AtomicU64>,
++  rx_bytes: Arc<AtomicU64>,
++  tx_errors: Arc<AtomicU32>,
++  rx_errors: Arc<AtomicU32>,
+ ) {
+   let server =
+     UdpSocketWrapper::new(Some(self_info.ip_address), self_info.info_request_port, shutdown).await;
+   let mut recv_buff = crate::net_utils::ReceiveBuffer::new();
+-  let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks);
++  let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks, tx_bytes, rx_bytes, tx_errors, rx_errors);
+   mcaster.send_board_info().await;
+   mcaster.send_product_info().await;
+   let mut heartbeat_interval = interval(Duration::from_secs(1));
+@@ -423,6 +483,12 @@ pub async fn run_server(
+               &[0, 0, 0, 3, 0, 0, 0, 0]
+             ).await;
+           }
++          [0x07, _, 0, 0x81, 0, 0, 0, _] => {
++            mcaster.send_sample_rate().await;
++          }
++          [0x07, _, 0, 0x83, 0, 0, 0, _] => {
++            mcaster.send_encoding().await;
++          }
+           _ => {
+             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));
+             warn!("raw udp payload: {}", hex::encode(request_buf));
+diff --git a/inferno_aoip/src/device_server/mod.rs b/inferno_aoip/src/device_server/mod.rs
+index f991b7e..5697823 100644
+--- a/inferno_aoip/src/device_server/mod.rs
++++ b/inferno_aoip/src/device_server/mod.rs
+@@ -15,7 +15,7 @@ use tx_multicasts::TransmitMulticasts;
+ use std::collections::BTreeMap;
+ use std::io::Write;
+ use std::pin::Pin;
+-use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
+ use std::sync::{Arc, RwLock};
+ 
+ use std::time::{Duration, Instant};
+@@ -77,6 +77,10 @@ pub struct DeviceServer {
+   shutdown_todo: Pin<Box<dyn Future<Output = ()> + Send>>,
+   tx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+   rx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
++  pub tx_bytes: Arc<AtomicU64>,
++  pub rx_bytes: Arc<AtomicU64>,
++  pub tx_errors: Arc<AtomicU32>,
++  pub rx_errors: Arc<AtomicU32>,
+ }
+ 
+ impl DeviceServer {
+@@ -118,6 +122,10 @@ impl DeviceServer {
+     let rxps = rx_peaks_supplier.clone();
+     let flows_tx: Arc<Mutex<Option<FlowsTransmitter>>> = Default::default();
+     let tx_multicasts: Arc<Mutex<Option<TransmitMulticasts>>> = Default::default();
++    let tx_bytes: Arc<AtomicU64> = Arc::new(0.into());
++    let rx_bytes: Arc<AtomicU64> = Arc::new(0.into());
++    let tx_errors: Arc<AtomicU32> = Arc::new(0.into());
++    let rx_errors: Arc<AtomicU32> = Arc::new(0.into());
+     tasks.append(&mut vec![
+       tokio::spawn(arc_server::run_server(
+         self_info.clone(),
+@@ -137,6 +145,10 @@ impl DeviceServer {
+         channels_sub_rx,
+         Box::new(move || ((rxps.read().unwrap())(), (txps.read().unwrap())())),
+         shdn_recv3,
++        tx_bytes.clone(),
++        rx_bytes.clone(),
++        tx_errors.clone(),
++        rx_errors.clone(),
+       )),
+     ]);
+ 
+@@ -168,11 +180,13 @@ impl DeviceServer {
+       tx_multicasts_by_channel,
+       rx_peaks_supplier,
+       tx_peaks_supplier,
+-      //tasks,
+-      //tx_inputs,
+       shutdown_todo,
+       rx_shutdown_todo: None,
+       tx_shutdown_todo: None,
++      tx_bytes,
++      rx_bytes,
++      tx_errors,
++      rx_errors,
+     }
+   }
+ 
+@@ -237,6 +251,8 @@ impl DeviceServer {
+       srx1,
+       current_timestamp,
+       on_transfer,
++      self.rx_bytes.clone(),
++      self.rx_errors.clone(),
+     );
+     let flows_rx_handle = Arc::new(flows_rx_handle);
+     let (channels_sub_handle, channels_sub_worker) = ChannelsSubscriber::new(
+@@ -303,6 +319,8 @@ impl DeviceServer {
+       start_time_rx,
+       current_timestamp.clone(),
+       on_transfer,
++      self.tx_bytes.clone(),
++      self.tx_errors.clone(),
+     );
+     *self.flows_tx.lock().await = Some(flows_tx_handle);
+     let txm = TransmitMulticasts::new(
+-- 
+2.43.0
+

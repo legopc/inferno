@@ -1,0 +1,53 @@
+From 52e2b86990ff92fed65858d8e5a97fad766318e8 Mon Sep 17 00:00:00 2001
+From: Jelle Jassies <jellejassies@outlook.com>
+Date: Mon, 6 Apr 2026 18:58:55 +0000
+Subject: [PATCH] feat: enable both Reboot+FactoryReset flags; factory reset is
+ a no-op
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DC may require both feature flags (0x40+0x80) to enable the Reboot button.
+Set content[0x17] = 0x08|0x40|0x80 to advertise both capabilities.
+
+Factory reset (conmon inner type 0x0091) logs a warning and does nothing —
+Inferno has no persistent state to clear and it would be unsafe to wipe config.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ inferno_aoip/src/device_server/info_mcast_server.rs | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/inferno_aoip/src/device_server/info_mcast_server.rs b/inferno_aoip/src/device_server/info_mcast_server.rs
+index 0066805..c2ff82c 100644
+--- a/inferno_aoip/src/device_server/info_mcast_server.rs
++++ b/inferno_aoip/src/device_server/info_mcast_server.rs
+@@ -144,11 +144,11 @@ impl<'s> Multicaster<'s> {
+     //   0x08 = Identify device (LED blink)
+     //   0x10 = Sample rate & encoding (enables DC to query/display these values)
+     //   0x40 = Reboot (enables the Reboot button in DC Device Config panel)
+-    //   0x80 = Factory reset (intentionally omitted — we don't implement factory reset)
++    //   0x80 = Factory reset (button enabled in DC; handler is a no-op — we just log and ignore)
+     content[0x14] = 0;
+     content[0x15] = 0;
+     content[0x16] = 0x10;
+-    content[0x17] = 0x08 | 0x40; // Identify + Reboot; 0x80 (factory reset) intentionally excluded
++    content[0x17] = 0x08 | 0x40 | 0x80; // Identify + Reboot + Factory Reset (factory reset is a no-op)
+ 
+     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
+     content[0xbf] = 5;   // T1.6: limit DC polling rate for board-info sub-types (matches reference capture)
+@@ -546,6 +546,11 @@ pub async fn run_server(
+             // DC periodic heartbeat query — normal traffic, no response needed
+             trace!("DC heartbeat query received");
+           }
++          [0x07, _, 0, 0x91, 0, 0, 0, _] => {
++            // Factory reset command from DC — advertised as supported (flag 0x80) so button
++            // is enabled, but we deliberately do nothing. Inferno has no persistent state to clear.
++            warn!("Factory reset requested by DC — ignored (not implemented)");
++          }
+           _ => {
+             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));
+             warn!("raw udp payload: {}", hex::encode(request_buf));
+-- 
+2.43.0
+

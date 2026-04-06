@@ -1,0 +1,85 @@
+From 7f0e4e1b5b958038565a86e833c0e413a8541fd9 Mon Sep 17 00:00:00 2001
+From: Jelle Jassies <jellejassies@outlook.com>
+Date: Mon, 6 Apr 2026 06:00:44 +0000
+Subject: [PATCH] feat(T2.2): timestamp-gap missed-packet detection in flows_rx
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace the late-packet counter (which counted packets arriving after
+their latency deadline) with real missed-packet detection using Dante
+timestamp gaps.
+
+The Dante packet format is [0x02][u32 secs BE][u32 subsec_samples BE]
+[PCM data...] — there is NO sequence number field. Detection works by
+comparing consecutive packet timestamps:
+
+- Track last_rx_timestamp and last_frame_samples per SocketData
+- On each receive, compute expected_ts = last_ts + frame_size
+- If gap = current_ts - expected_ts exceeds half a frame, count
+  gap / frame_size as missed packets
+- Gaps > 5 seconds are treated as stream restarts (no count)
+
+The missed_packets Arc<AtomicU32> is already wired to DC heartbeat
+(0x8004 block) — this change makes the counter reflect true loss.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ inferno_aoip/src/device_server/flows_rx.rs | 27 ++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/inferno_aoip/src/device_server/flows_rx.rs b/inferno_aoip/src/device_server/flows_rx.rs
+index d6930f3..5c19a6d 100644
+--- a/inferno_aoip/src/device_server/flows_rx.rs
++++ b/inferno_aoip/src/device_server/flows_rx.rs
+@@ -50,6 +50,8 @@ struct SocketData<P: ProxyToSamplesBuffer> {
+   empty_sinks_vecs: Vec<Vec<RBInput<Sample, P>>>,
+   actual_latency_samples: Arc<AtomicI32>,
+   missed_packets: Arc<AtomicU32>,
++  last_rx_timestamp: Option<Clock>,  // T2.2: last received packet timestamp for gap detection
++  last_frame_samples: usize,         // T2.2: frame size seen in previous packet
+ }
+ 
+ struct SilenceWriter<P: ProxyToSamplesBuffer> {
+@@ -128,8 +130,27 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
+           if let Some(now) = clock.wrapping_now_in_timebase(sample_rate.into()) {
+             let latency = wrapped_diff(now, timestamp).clamp(0, i32::MAX as _);
+             sd.actual_latency_samples.fetch_max(latency as _, Ordering::Relaxed);
+-            if latency > sd.latency_samples as isize {
+-              sd.missed_packets.fetch_add(1, Ordering::Relaxed);
++          }
++
++          // T2.2: detect truly missed packets via timestamp gap (no sequence number in Dante)
++          let num_ch = sd.channels.len();
++          if num_ch > 0 && sd.bytes_per_sample > 0 {
++            let samples_this_pkt = (recv_size - 9) / (num_ch * sd.bytes_per_sample);
++            if samples_this_pkt > 0 {
++              if let (Some(last_ts), frame_sz) = (sd.last_rx_timestamp, sd.last_frame_samples) {
++                if frame_sz > 0 {
++                  let expected_ts = last_ts.wrapping_add(frame_sz as Clock);
++                  let gap = wrapped_diff(timestamp, expected_ts);
++                  if gap > sample_rate as isize * 5 {
++                    // Stream restart or very large gap — reset state, don't count as missed
++                  } else if gap > frame_sz as isize / 2 {
++                    let missed = (gap / frame_sz as isize).max(0) as u32;
++                    sd.missed_packets.fetch_add(missed, Ordering::Relaxed);
++                  }
++                }
++              }
++              sd.last_rx_timestamp = Some(timestamp);
++              sd.last_frame_samples = samples_this_pkt;
+             }
+           }
+ 
+@@ -600,6 +621,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+           empty_sinks_vecs,
+           actual_latency_samples: als,
+           missed_packets: mp,
++          last_rx_timestamp: None,
++          last_frame_samples: 0,
+         },
+       })
+       .await
+-- 
+2.43.0
+
