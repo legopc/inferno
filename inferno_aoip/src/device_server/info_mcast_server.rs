@@ -525,13 +525,11 @@ pub async fn run_server(
             mcaster.send_network_info().await;
           }
           [0x07, _, 0, 0x77, 0, 0, 0, _] => {
-            // T3.9: clear config — exit(0), systemd Restart=on-failure relaunches
-            warn!("Clear Config requested by Dante Controller — restarting");
-            mcaster.send(
-              mcaster.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x78, 0, 0, 0, 0],
-              &[0, 0, 0, 3, 0, 0, 0, 0]
-            ).await;
-            std::process::exit(0);
+            // T3.9 REVERTED: DC sends 0x0077 automatically on reconnect (not only user-initiated).
+            // Exiting here causes an infinite restart loop. Keep as a no-op until we can
+            // distinguish automatic DC registration sends from deliberate user Clear Config.
+            // TODO T3.9: needs capture analysis to find a distinguishing field.
+            trace!("Clear Config 0x0077 received — no-op (see T3.9)");
           }
           [0x07, _, 0, 0x81, 0, 0, 0, _] => {
             mcaster.send_sample_rate().await;
