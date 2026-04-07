@@ -542,31 +542,31 @@ this may already limit what DC offers — needs capture to confirm.
 ### T3.9 — Implement Clear Config (conmon 0x0077)
 
 **Context**: The Clear Config button in DC Device Config is clickable (despite attempts to grey
-it via board_info `0x15`) and sends conmon opcode `0x0077`. Currently inferno logs and ignores it.
+it via board_info `0x15`) and sends conmon opcode `0x0077`. Currently handled as a silent no-op.
 
-**Desired behaviour**: when DC sends `0x0077`, inferno should reset all runtime Dante state it
-holds in memory — specifically:
-- Clear any stored channel subscriptions / routing assignments
-- Reset device name to the default (hostname-derived)
-- Discard any cached peer device information
-- Do **not** affect the ALSA plugin config or systemd unit files (those are not Dante state)
+**⚠️ IMPORTANT — Do NOT implement as exit(0) without capture analysis first**
 
-**Why this is safe**: inferno holds no persistent on-disk Dante config. A "clear" is therefore
-equivalent to a soft reset of in-memory state without a full process restart. The user expects
-this to match the behaviour of a real Dante device's Clear Config.
+Attempted (Apr 2026): exit(0) was implemented on `0x0077`. This caused an **infinite restart loop**
+because DC sends `0x0077` automatically on every device reconnect — not only when the user clicks
+Clear Config. The device would restart, DC would reconnect and immediately send `0x0077` again.
+The change was reverted. The handler is back to a no-op (trace-level log only).
 
-**Implementation sketch**:
-1. In the `0x0077` match arm in `info_mcast_server.rs`, send a message on the existing channel
-   infrastructure to reset subscription state in `flows_rx.rs` / `arc_server.rs`
-2. Alternatively, call `std::process::exit(0)` (same as Reboot) — systemd restarts the service
-   cleanly, which achieves the same result since all state is in-memory. Simpler and correct.
-3. Ack with an appropriate conmon response code so DC knows the command was accepted.
+**Blocker — required before implementation**:
+1. Capture `0x0077` traffic during a deliberate user Clear Config click vs DC's automatic
+   registration sequence. Identify a distinguishing field (seqnum range, payload byte, timing).
+2. Only then can the handler safely differentiate user-initiated clears from automatic ones.
 
-**Recommended approach**: exit(0) + systemd restart — identical mechanism to Reboot, zero risk
-of partial-reset bugs. Only diverges from a real device if DC expects state to differ from a
-full reboot after a clear config.
+**Desired behaviour** (once distinguishable):
+- Clear stored channel subscriptions / routing assignments
+- Reset in-memory Dante state
+- Do **not** affect ALSA plugin config or systemd unit files
+- Ack with `0x0078` response so DC knows the command was accepted
 
-**Complexity**: Low if using exit(0); Medium if implementing selective in-memory state reset.
+**Implementation options** (once the triggering condition is understood):
+1. In-memory state reset — send message on channel infrastructure to reset `flows_rx.rs` / `arc_server.rs` without restarting
+2. exit(0) + systemd restart — only safe if we can guarantee DC won't re-send immediately
+
+**Complexity**: Medium — capture analysis required first; implementation itself is low effort.
 
 ---
 
@@ -773,7 +773,7 @@ Phase 1 ✅ Done (Apr–May 2026):
 Phase 2 — Next up (low–medium risk):
   T2.9 (validate 0x8002 peaks vs Shure capture) → T2.10 (investigate arcp_vers)
   T2.8 (0x1100 property query) → T2.3 (clock domain)
-  T3.9 (Clear Config exit+restart) → T3.10 (Identify 0x0BC8 handler)
+  T3.9 (Clear Config — blocked on capture analysis) → T3.10 (Identify 0x0BC8 handler)
   T3.11 (persistent subscription state) → T2.6 (upstream GitLab submission)
 
 Phase 3 — Medium complexity:
