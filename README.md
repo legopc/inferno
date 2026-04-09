@@ -1,3 +1,13 @@
+> **⚠️ Fork Notice**
+> This is a fork of [inferno-aoip](https://gitlab.com/lumifaza/inferno) by [lumifaza](https://gitlab.com/lumifaza) and contributors.
+> All credit for the Dante protocol implementation goes to the original authors.
+> This fork is used as part of the [Inferno AoIP Ecosystem](https://github.com/legopc/inferno-aoip-releases) project
+> and contains additional patches for Dante Controller integration and latency reporting.
+> For the canonical upstream project, see [gitlab.com/lumifaza/inferno](https://gitlab.com/lumifaza/inferno).
+
+---
+
+
 # Inferno - unofficial implementation of Dante protocol
 
 [GitLab](https://gitlab.com/lumifaza/inferno) | [GitHub](https://github.com/teodly/inferno) | [Principal author's website](https://info.lumifaza.org/)
