@@ -13,14 +13,16 @@ use futures::{Future, FutureExt};
 
 use itertools::Itertools;
 use tokio::{
-  sync::mpsc,
+  sync::{mpsc, Notify},
   time::interval,
 };
 
 // Lower value = lower audio playthrough latency. Must be > 0.
 // The consuming side (device.rs LEAD_SAMPLES) must exceed READ_INTERVAL_MS * sample_rate / 1000
 // samples to avoid gaps. E.g. at 2 ms and 48000 Hz: min LEAD = 96 samples.
-const READ_INTERVAL: Duration = Duration::from_millis(2);
+// NOTE: In event-driven mode (data_notify wired) this interval is only a safety-net fallback.
+// Normally samples_collector wakes within <0.5 ms of packet arrival via TransferNotifier.
+const FALLBACK_INTERVAL: Duration = Duration::from_millis(10);
 const BUFFER_SIZE: usize = 65536;
 const SANE_CLOCK_DIFF: usize = 192000;
 const MAX_LAG_SAMPLES: Clock = 9600;
@@ -204,6 +206,7 @@ struct PeriodicSamplesCollector<P: ProxyToSamplesBuffer> {
   commands_receiver: mpsc::Receiver<Command<P>>,
   channels: Vec<Option<Channel<P>>>,
   callback: SamplesCallback,
+  data_notify: Arc<Notify>,
 }
 
 fn get_min_max_end_timestamps<'a, P: ProxyToSamplesBuffer + 'a>(
@@ -226,13 +229,22 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
   }
   async fn run(&mut self) {
     let mut clock = None;
-    let mut read_data_interval = interval(READ_INTERVAL);
-    read_data_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut fallback_interval = interval(FALLBACK_INTERVAL);
+    fallback_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut channels_buffers = (0..self.channels.len()).map(|_| vec![0; BUFFER_SIZE]).collect_vec();
-    loop {
+    'outer: loop {
       tokio::select! {
-        _ = read_data_interval.tick() => {
-          if let Some((min_end_ts, max_end_ts)) = self.get_min_max_end_timestamps() {
+        biased;
+        command_opt = self.commands_receiver.recv() => {
+          if !self.handle_command(command_opt).await {
+            break 'outer;
+          }
+          continue 'outer;
+        }
+        _ = self.data_notify.notified() => {}
+        _ = fallback_interval.tick() => {}
+      }
+      if let Some((min_end_ts, max_end_ts)) = self.get_min_max_end_timestamps() {
             // lag prevention logic to prevent abruptly disconnected transmitters from causing buffer overrun
             // in other audio channels
             let lag = max_end_ts.wrapping_sub(min_end_ts);
@@ -298,13 +310,6 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
             }
             clock = Some(new_clock);
           }
-        }
-        command_opt = self.commands_receiver.recv() => {
-          if !self.handle_command(command_opt).await {
-            break;
-          }
-        }
-      }
     }
   }
   async fn handle_command(&mut self, command_opt: Option<Command<P>>) -> bool {
@@ -341,12 +346,14 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static> SamplesCollector<P> {
   pub fn new_with_callback(
     self_info: Arc<DeviceInfo>,
     callback: SamplesCallback,
+    data_notify: Arc<Notify>,
   ) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
     let (tx, rx) = mpsc::channel(100);
     let mut internal = PeriodicSamplesCollector {
       commands_receiver: rx,
       channels: (0..self_info.rx_channels.len()).map(|_| None).collect(),
       callback,
+      data_notify,
     };
     return (Self { commands_sender: tx }, async move { internal.run().await }.boxed());
   }

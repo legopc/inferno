@@ -193,13 +193,19 @@ impl DeviceServer {
   }
 
   pub async fn receive_with_callback(&mut self, samples_callback: SamplesCallback) {
+    let data_notify = Arc::new(tokio::sync::Notify::new());
     let (col, col_fut) = SamplesCollector::<OwnedBuffer<Atomic<Sample>>>::new_with_callback(
       self.self_info.clone(),
       Box::new(samples_callback),
+      data_notify.clone(),
     );
     let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, self.rx_jitter_samples, Arc::new(col));
-    self.receive(tasks, None, buffering, Default::default(), None).await;
+    let on_transfer = Some(TransferNotifier {
+      callback: Box::new(move || data_notify.notify_one()),
+      max_interval_samples: 48, // fire at most once per 1 ms (batches per-packet wakeups)
+    });
+    self.receive(tasks, None, buffering, Default::default(), on_transfer).await;
   }
   pub async fn receive_realtime(&mut self) -> RealTimeSamplesReceiver<OwnedBuffer<Atomic<Sample>>> {
     let (col, col_fut, rt_recv) =
