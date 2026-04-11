@@ -17,7 +17,10 @@ use tokio::{
   time::interval,
 };
 
-const READ_INTERVAL: Duration = Duration::from_millis(50);
+// Lower value = lower audio playthrough latency. Must be > 0.
+// The consuming side (device.rs LEAD_SAMPLES) must exceed READ_INTERVAL_MS * sample_rate / 1000
+// samples to avoid gaps. E.g. at 2 ms and 48000 Hz: min LEAD = 96 samples.
+const READ_INTERVAL: Duration = Duration::from_millis(2);
 const BUFFER_SIZE: usize = 65536;
 const SANE_CLOCK_DIFF: usize = 192000;
 const MAX_LAG_SAMPLES: Clock = 9600;

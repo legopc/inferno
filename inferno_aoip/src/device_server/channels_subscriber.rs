@@ -34,8 +34,6 @@ use tokio::{sync::mpsc, time::sleep, time::timeout};
 
 use super::flows_rx::{FlowInfo, FlowsReceiver};
 
-const REORDER_WAIT_SAMPLES: usize = 4800;
-
 enum Command {
   Shutdown,
   Subscribe { local_channel_index: usize, tx_channel_name: String, tx_hostname: String },

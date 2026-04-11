@@ -68,6 +68,7 @@ pub struct DeviceServer {
   mdns_server: Arc<DeviceMDNSResponder>,
   mcast_tx: mpsc::Sender<crate::protocol::mcast::MulticastMessage>,
   tx_latency_ns: u32,
+  rx_jitter_samples: usize,
   channels_sub_tx: watch::Sender<Option<Arc<ChannelsSubscriber>>>,
   flows_tx: Arc<Mutex<Option<FlowsTransmitter>>>,
   tx_multicasts: Arc<Mutex<Option<TransmitMulticasts>>>,
@@ -174,6 +175,7 @@ impl DeviceServer {
       mdns_server,
       mcast_tx,
       tx_latency_ns: settings.tx_latency_ns,
+      rx_jitter_samples: settings.rx_jitter_samples,
       channels_sub_tx,
       flows_tx,
       tx_multicasts,
@@ -196,14 +198,14 @@ impl DeviceServer {
       Box::new(samples_callback),
     );
     let tasks = vec![tokio::spawn(col_fut)];
-    let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
+    let buffering = OwnedBuffering::new(524288 /*TODO*/, self.rx_jitter_samples, Arc::new(col));
     self.receive(tasks, None, buffering, Default::default(), None).await;
   }
   pub async fn receive_realtime(&mut self) -> RealTimeSamplesReceiver<OwnedBuffer<Atomic<Sample>>> {
     let (col, col_fut, rt_recv) =
       SamplesCollector::new_realtime(self.self_info.clone(), self.get_realtime_clock_receiver());
     let tasks = vec![tokio::spawn(col_fut)];
-    let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
+    let buffering = OwnedBuffering::new(524288 /*TODO*/, self.rx_jitter_samples, Arc::new(col));
     self.receive(tasks, None, buffering, Default::default(), None).await;
 
     rt_recv
@@ -215,7 +217,7 @@ impl DeviceServer {
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
   ) {
-    let buffering = ExternalBuffering::new(rx_channels_buffers, 4800 /*TODO*/);
+    let buffering = ExternalBuffering::new(rx_channels_buffers, self.rx_jitter_samples);
     let rbs = buffering.ring_buffers.clone();
     *self.rx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
     self.receive(vec![], Some(start_time_rx), buffering, current_timestamp, on_transfer).await;

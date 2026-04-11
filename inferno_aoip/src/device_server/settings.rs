@@ -158,6 +158,11 @@ pub struct Settings {
   pub tx_latency_ns: u32,
   pub clock_path: Option<PathBuf>,
   pub use_safe_clock: bool,
+  /// Hole-fix wait passed to OwnedBuffering / ExternalBuffering.
+  /// Only adds latency when actual packet loss occurs; on a clean LAN this has no effect
+  /// on normal-path audio latency. Default 4800 (100 ms at 48 kHz) for robustness.
+  /// Set to 192 (4 ms) for a clean LAN to improve recovery time after brief glitches.
+  pub rx_jitter_samples: usize,
 }
 
 impl Settings {
@@ -193,6 +198,10 @@ impl Settings {
         .unwrap_or(10_000_000),
       clock_path: config.get("CLOCK_PATH").map(|p| p.try_into().unwrap()),
       use_safe_clock,
+      rx_jitter_samples: config
+        .get("RX_JITTER_SAMPLES")
+        .map(|s| s.parse().expect("invalid RX_JITTER_SAMPLES, must be usize"))
+        .unwrap_or(4800),
     };
 
     // the following should be harmless, as the application still has the chance to overwrite it
