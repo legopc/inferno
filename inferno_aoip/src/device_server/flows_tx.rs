@@ -54,6 +54,8 @@ struct Flow {
   bytes_per_sample: usize,
   expires: Option<Clock>,
   expired: Arc<AtomicBool>,
+  is_multicast: bool,
+  first_hard_send_error_at: Option<Instant>,
 }
 
 impl Flow {
@@ -178,17 +180,32 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           }
         }
         let to_send = 9 + stride * flow.fpp;
-        if let Ok(written) = flow.socket.send(&pbuff[0..to_send]) {
-          if written == to_send {
+        match flow.socket.send(&pbuff[0..to_send]) {
+          Ok(written) => {
             flow.next_ts = flow.next_ts.wrapping_add(flow.fpp.try_into().unwrap());
             self.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
-          } else {
-            warn!("written {written}, should have {to_send}");
+            if written != to_send {
+              warn!("written {written}, should have {to_send}");
+              self.tx_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            flow.first_hard_send_error_at = None;
+          }
+          Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {
+            // transient kernel buffer pressure, skip silently
+          }
+          Err(e) if flow.is_multicast => {
+            self.tx_errors.fetch_add(1, Ordering::Relaxed);
+            let t = flow.first_hard_send_error_at.get_or_insert_with(Instant::now);
+            if t.elapsed() >= Duration::from_secs(10) {
+              info!("multicast flow {:?} erroring for 10s ({e:?}), marking expired for cleanup",
+                flow.socket.peer_addr().ok());
+              flow.expired.store(true, Ordering::Release);
+            }
+          }
+          Err(_) => {
+            warn!("send returned error");
             self.tx_errors.fetch_add(1, Ordering::Relaxed);
           }
-        } else {
-          warn!("send returned error");
-          self.tx_errors.fetch_add(1, Ordering::Relaxed);
         }
         iterations += 1;
         if (iterations % 16) == 0 {
@@ -254,6 +271,11 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           error!("clock unavailable, can't transmit. is the PTP daemon running?");
           last_clock_error_log = Instant::now();
         }
+        // Break out on Shutdown or channel close so stop_transmitter() doesn't deadlock.
+        match self.commands_receiver.try_recv() {
+          Ok(Command::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => return,
+          _ => {}
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
       }
     };
@@ -288,6 +310,11 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         if last_clock_error_log.elapsed() >= Duration::from_secs(30) {
           error!("clock unavailable, can't transmit. is the PTP daemon running?");
           last_clock_error_log = Instant::now();
+        }
+        // Break out on Shutdown or channel close so stop_transmitter() doesn't deadlock.
+        match self.commands_receiver.try_recv() {
+          Ok(Command::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => return,
+          _ => {}
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
         continue;
@@ -325,7 +352,11 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
             error!("clock unavailable, can't transmit. is the PTP daemon running?");
             last_clock_error_log = Instant::now();
           }
-          self.commands_receiver.try_recv().unwrap_or(Command::NoOp)
+          match self.commands_receiver.try_recv() {
+            Ok(cmd) => cmd,
+            Err(mpsc::error::TryRecvError::Disconnected) => Command::Shutdown,
+            Err(mpsc::error::TryRecvError::Empty) => Command::NoOp,
+          }
         }
       } else {
         // on_transfer callback must be called to notify about transmission in previous iteration,
@@ -393,6 +424,8 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
             bytes_per_sample,
             expires: if needs_keepalives { Some(0) } else { None },
             expired,
+            is_multicast: !needs_keepalives,
+            first_hard_send_error_at: None,
           };
           if let Some(now) = self.now() {
             flow.bootstrap_next_ts(now);
@@ -419,6 +452,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
               flow.bootstrap_next_ts(now);
             }
             flow.expired.store(false, Ordering::Release);
+            flow.first_hard_send_error_at = None;
           }
         }
         Command::NoOp => {}
@@ -431,6 +465,7 @@ struct FlowData {
   cookie: u16,
   remote: SocketAddr,
   expired: Arc<AtomicBool>,
+  activated: bool,
 }
 
 #[derive(Debug)]
@@ -595,6 +630,7 @@ impl FlowsTransmitter {
           remote: dst_addr.clone(),
           // we're adding multicast flow as 'expired' to give it grace period for multicast address collission detection
           expired: Arc::new(AtomicBool::new(is_multicast)),
+          activated: false,
         };
 
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self.self_info.ip_address), 0))?;
@@ -647,7 +683,25 @@ impl FlowsTransmitter {
   }
   pub fn activate_multicast_flow(&mut self, flow_index: u32) {
     // this is called for multicast flows after grace period
-    self.flows.get(&flow_index).as_ref().unwrap().expired.store(false, Ordering::Release);
+    if let Some(flow) = self.flows.get_mut(&flow_index) {
+      flow.expired.store(false, Ordering::Release);
+      flow.activated = true;
+    }
+  }
+  pub(crate) fn expired_activated_multicast_ids(&self) -> Vec<u32> {
+    self.flows
+      .iter()
+      .filter_map(|(index, flow)| {
+        if flow.expired.load(Ordering::Acquire)
+          && flow.activated
+          && self.flows_info[*index as usize].as_ref().map(|i| i.is_multicast()).unwrap_or(false)
+        {
+          Some(*index)
+        } else {
+          None
+        }
+      })
+      .collect()
   }
   pub fn random_multicast_destination(&self) -> (Ipv4Addr, u16) {
     loop {

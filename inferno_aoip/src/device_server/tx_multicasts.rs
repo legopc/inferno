@@ -277,6 +277,24 @@ impl TransmitMulticasts {
       Ok(())
     }
   }
+  pub async fn cleanup_expired_flows(&self) {
+    let expired_ids = {
+      let flows_tx_guard = self.flows_tx.lock().await;
+      if let Some(ft) = flows_tx_guard.as_ref() {
+        ft.expired_activated_multicast_ids()
+      } else {
+        return;
+      }
+    };
+    if expired_ids.is_empty() {
+      return;
+    }
+    for flow_index in expired_ids {
+      info!("zombie cleanup: removing expired multicast TX flow {flow_index}");
+      self.remove_flow_internal(flow_index as usize, true).await.log_and_forget();
+    }
+    self.save_state().await;
+  }
   pub async fn shutdown(&self) {
     {
       let _flows_tx_opt = self.flows_tx.lock().await;

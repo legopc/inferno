@@ -341,6 +341,20 @@ impl DeviceServer {
     );
     txm.load_state().await;
     *self.tx_multicasts.lock().await = Some(txm);
+    {
+      let tx_multicasts_bg = self.tx_multicasts.clone();
+      tokio::spawn(async move {
+        loop {
+          tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+          let mut guard = tx_multicasts_bg.lock().await;
+          if let Some(txm) = guard.as_mut() {
+            txm.cleanup_expired_flows().await;
+          } else {
+            break;
+          }
+        }
+      });
+    }
     for (index, _) in self.self_info.tx_channels.iter().enumerate() {
       self.mdns_server.remove_tx_channel(index);
       self.mdns_server.add_tx_channel(index);
