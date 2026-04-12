@@ -38,6 +38,8 @@ pub struct DeviceInfo {
   pub latency_ns: usize,
   pub tx_latency_ns: usize, // T1.8: TX latency separate from RX, used by mDNS TX channel/bundle records
   pub sample_rate: u32,
+  // Optional product version override shown in Dante Controller. Overrides CARGO_PKG_VERSION.
+  pub product_version_bytes: Option<[u8; 4]>,
 
   pub arc_port: u16,
   pub cmc_port: u16,

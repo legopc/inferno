@@ -72,12 +72,12 @@ impl<'s> Multicaster<'s> {
         H(patch_version),
         L(patch_version),
       ],
-      product_version_bytes: [
+      product_version_bytes: self_info.product_version_bytes.unwrap_or([
         env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
         env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
         H(patch_version),
         L(patch_version),
-      ],
+      ]),
       device_info_destination: SocketAddr::new(
         IpAddr::V4(Ipv4Addr::new(224, 0, 0, 231)),
         DST_PORT_DEVICE_INFO,

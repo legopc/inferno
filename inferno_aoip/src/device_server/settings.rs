@@ -140,6 +140,7 @@ fn create_self_info(
     cmc_port: CMC_PORT,
     flows_control_port: FLOWS_CONTROL_PORT,
     info_request_port: INFO_REQUEST_PORT,
+    product_version_bytes: None,
   };
 
   if let Some(altport) = settings.get("ALT_PORT").map(|s| s.parse().expect("ALT_PORT must be u16")) {
