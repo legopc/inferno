@@ -66,12 +66,12 @@ impl<'s> Multicaster<'s> {
       server,
       seqnum: 1,
       vendor: [32; 8],
-      firmware_version_bytes: [
-        env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(), // T1.5: derive from Cargo version like product_version_bytes
+      firmware_version_bytes: self_info.firmware_version_bytes.unwrap_or([
+        env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
         env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
         H(patch_version),
         L(patch_version),
-      ],
+      ]),
       product_version_bytes: self_info.product_version_bytes.unwrap_or([
         env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
         env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
