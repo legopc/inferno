@@ -1,3 +1,5 @@
+use libc;
+
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -56,6 +58,7 @@ struct Flow {
   expired: Arc<AtomicBool>,
   is_multicast: bool,
   first_hard_send_error_at: Option<Instant>,
+  needs_rebind: bool,
 }
 
 impl Flow {
@@ -107,6 +110,7 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   on_transfer: Option<TransferNotifier>,
   tx_bytes: Arc<AtomicU64>,
   tx_errors: Arc<AtomicU32>,
+  needs_rebind: Arc<AtomicBool>,
   //callback: SamplesRequestCallback,
 }
 
@@ -202,9 +206,18 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
               flow.expired.store(true, Ordering::Release);
             }
           }
-          Err(_) => {
-            warn!("send returned error");
+          Err(e) => {
             self.tx_errors.fetch_add(1, Ordering::Relaxed);
+            if let Some(errno) = e.raw_os_error() {
+              if matches!(errno, libc::ENETDOWN | libc::ENETUNREACH | libc::EHOSTUNREACH) {
+                flow.needs_rebind = true;
+                info!("unicast TX socket marked for rebind ({:?})", e);
+              } else {
+                warn!("send returned error: {:?}", e);
+              }
+            } else {
+              warn!("send returned error: {:?}", e);
+            }
           }
         }
         iterations += 1;
@@ -228,6 +241,37 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         }
       }
     }
+  }
+
+  fn try_rebind_all(&mut self) {
+    if !self.needs_rebind.load(Ordering::Relaxed) {
+      return;
+    }
+    info!("Attempting to rebind TX sockets...");
+    for flow_opt in &mut self.flows {
+      if let Some(flow) = flow_opt {
+        if flow.needs_rebind {
+          let peer = flow.socket.peer_addr().ok();
+          let local_addr = flow.socket.local_addr().ok();
+          if let (Some(peer_addr), Some(local)) = (peer, local_addr) {
+            match std::net::UdpSocket::bind(format!("0.0.0.0:{}", local.port())) {
+              Ok(new_udp) => {
+                if new_udp.connect(peer_addr).is_ok() {
+                  new_udp.set_nonblocking(true).ok();
+                  flow.socket = new_udp;
+                  flow.needs_rebind = false;
+                  info!("TX socket rebound successfully");
+                }
+              }
+              Err(e) => {
+                error!("Failed to rebind TX socket: {:?}", e);
+              }
+            }
+          }
+        }
+      }
+    }
+    self.needs_rebind.store(false, Ordering::Relaxed);
   }
 
   async fn run(&mut self, mut start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
@@ -284,6 +328,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     drop(now);
 
     set_current_thread_realtime(81);
+    let mut iterations: u64 = 0;
     loop {
       let min_next_ts = self
         .flows
@@ -426,6 +471,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
             expired,
             is_multicast: !needs_keepalives,
             first_hard_send_error_at: None,
+            needs_rebind: false,
           };
           if let Some(now) = self.now() {
             flow.bootstrap_next_ts(now);
@@ -456,6 +502,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           }
         }
         Command::NoOp => {}
+      }
+      iterations += 1;
+      if (iterations % 100) == 0 {
+        self.try_rebind_all();
       }
     }
   }
@@ -530,6 +580,7 @@ impl FlowsTransmitter {
       on_transfer,
       tx_bytes,
       tx_errors,
+      needs_rebind: Arc::new(AtomicBool::new(false)),
     };
     internal.run(start_time_rx).await;
   }
