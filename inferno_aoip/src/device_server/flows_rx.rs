@@ -68,6 +68,7 @@ struct SocketData<P: ProxyToSamplesBuffer> {
   last_source: Option<SocketAddr>,
   last_packet_time: Arc<AtomicUsize>, // timebase: seconds since ref_instant
   bytes_per_sample: usize,
+  port: u16,
   latency_samples: usize,
   channels: Vec<Option<Channel<P>>>,
   empty_sinks_vecs: Vec<Vec<RBInput<Sample, P>>>,
@@ -75,6 +76,16 @@ struct SocketData<P: ProxyToSamplesBuffer> {
   missed_packets: Arc<AtomicU32>,
   last_rx_timestamp: Option<Clock>,  // T2.2: last received packet timestamp for gap detection
   last_frame_samples: usize,         // T2.2: frame size seen in previous packet
+}
+
+impl<P: ProxyToSamplesBuffer> SocketData<P> {
+    fn recreate_socket(&mut self) -> Result<(), std::io::Error> {
+        let port = self.socket.local_addr()?.port();
+        let new_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", port))?;
+        new_socket.set_nonblocking(true)?;
+        self.socket = mio::net::UdpSocket::from_std(new_socket);
+        Ok(())
+    }
 }
 
 struct SilenceWriter<P: ProxyToSamplesBuffer> {
@@ -210,7 +221,21 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
         Err(e) => {
           if e.kind() != WouldBlock {
             error!("flow socket receive error: {:?}", e);
-            // TODO recreate socket?
+            if let Some(errno) = e.raw_os_error() {
+              match errno {
+                64 | 101 | 113 => {
+                  info!("Network unreachable, recreating socket on port {}", sd.socket.local_addr().map(|a| a.port()).unwrap_or(0));
+                  if let Err(recv_err) = sd.recreate_socket() {
+                    error!("Failed to recreate socket: {:?}", recv_err);
+                  }
+                }
+                _ => {
+                  rx_errors.fetch_add(1, Ordering::Relaxed);
+                }
+              }
+            } else {
+              rx_errors.fetch_add(1, Ordering::Relaxed);
+            }
           }
           break;
         }
@@ -633,6 +658,7 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
           last_source: None,
           last_packet_time: last_packet_time_arc,
           bytes_per_sample,
+          port,
           latency_samples,
           channels: (0..channels_count).map(|_| None).collect(),
           empty_sinks_vecs,
