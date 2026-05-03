@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 pub use usrvclock::AsyncClient as ClockReceiver;
 pub use usrvclock::ClockOverlay;
@@ -19,6 +20,8 @@ pub type FineClockDiff = i64;
 //#[derive(Clone)]
 pub struct MediaClock {
   overlay: Option<ClockOverlay>,
+  last_update: Instant,
+  sync_timeout: Duration,
 }
 
 #[inline(always)]
@@ -29,10 +32,20 @@ fn timestamp_to_clock_value(ts: clock_steering::Timestamp) -> FineClock {
 impl MediaClock {
   pub fn new(use_safe_clock: bool) -> Self {
     assert!(!use_safe_clock);
-    Self { overlay: None }
+    Self {
+      overlay: None,
+      last_update: Instant::now(),
+      sync_timeout: Duration::from_secs(5),
+    }
   }
   pub fn is_ready(&self) -> bool {
     self.overlay.is_some()
+  }
+  pub fn is_fresh(&self) -> bool {
+    self.overlay.is_some() && self.last_update.elapsed() < self.sync_timeout
+  }
+  pub fn is_sync_lost(&self) -> bool {
+    self.overlay.is_none() || self.last_update.elapsed() >= self.sync_timeout
   }
   pub fn get_overlay(&self) -> &Option<ClockOverlay> {
     &self.overlay
@@ -48,6 +61,7 @@ impl MediaClock {
       } */
     } */
     self.overlay = Some(overlay);
+    self.last_update = Instant::now();
   }
   #[inline(always)]
   pub fn now_ns(&self) -> Option<FineClock> {
