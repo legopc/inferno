@@ -295,6 +295,22 @@ impl TransmitMulticasts {
     }
     self.save_state().await;
   }
+  pub async fn re_advertise_all(&self) {
+    if !self.should_work.load(std::sync::atomic::Ordering::SeqCst) {
+      return;
+    }
+    info!("Re-advertising all multicast TX flows after interface reconnect");
+    let bundles = self.bundles.lock().await;
+    for (flow_index, bundle_opt) in bundles.iter().enumerate() {
+      if let Some(bundle) = bundle_opt {
+        let dst_addr = Ipv4Addr::from_bits(bundle.dst_addr.load(std::sync::atomic::Ordering::SeqCst));
+        if !dst_addr.is_unspecified() {
+          self.mdns_server.reserve_multicast_ip(dst_addr);
+          info!("Re-advertised multicast flow {} at {}", flow_index, dst_addr);
+        }
+      }
+    }
+  }
   pub async fn shutdown(&self) {
     {
       let _flows_tx_opt = self.flows_tx.lock().await;

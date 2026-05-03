@@ -111,12 +111,26 @@ impl DeviceServer {
     let shared_media_clock = make_shared_media_clock(&clock_receiver, settings.use_safe_clock).await;
     info!("clock ready");
 
+    let tx_multicasts: Arc<Mutex<Option<TransmitMulticasts>>> = Default::default();
     let (iface_tx, _) = broadcast::channel(16);
     let iface_name = settings.bind_iface.clone();
     let shdn_recv_iface = shutdown_send.subscribe();
+    let iface_tx_clone = iface_tx.clone();
     tokio::spawn(async move {
         let mut monitor = interface_monitor::InterfaceMonitor::new(&iface_name);
-        monitor.run(iface_tx).await;
+        monitor.run(iface_tx_clone).await;
+    });
+
+    let tx_mcasts = tx_multicasts.clone();
+    tokio::spawn(async move {
+        let mut rx = iface_tx.subscribe();
+        while let Ok(event) = rx.recv().await {
+            if matches!(event, interface_monitor::InterfaceEvent::Up(_)) {
+                if let Some(ref tm) = *tx_mcasts.lock().await {
+                    tm.re_advertise_all().await;
+                }
+            }
+        }
     });
 
     let mut tasks = vec![];
@@ -132,7 +146,6 @@ impl DeviceServer {
     let txps = tx_peaks_supplier.clone();
     let rxps = rx_peaks_supplier.clone();
     let flows_tx: Arc<Mutex<Option<FlowsTransmitter>>> = Default::default();
-    let tx_multicasts: Arc<Mutex<Option<TransmitMulticasts>>> = Default::default();
     let tx_bytes: Arc<AtomicU64> = Arc::new(0.into());
     let rx_bytes: Arc<AtomicU64> = Arc::new(0.into());
     let tx_errors: Arc<AtomicU32> = Arc::new(0.into());
