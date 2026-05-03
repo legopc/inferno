@@ -165,6 +165,7 @@ pub struct Settings {
   /// on normal-path audio latency. Default 4800 (100 ms at 48 kHz) for robustness.
   /// Set to 192 (4 ms) for a clean LAN to improve recovery time after brief glitches.
   pub rx_jitter_samples: usize,
+  pub bind_iface: String,
 }
 
 impl Settings {
@@ -187,6 +188,30 @@ impl Settings {
     });
     let self_info = create_self_info(app_name, short_app_name, my_ip, &config);
 
+    let bind_iface = config
+      .get("BIND_IP")
+      .map(|ipstr| {
+        let interfaces = netdev::get_interfaces();
+        if interfaces.iter().any(|iface| &iface.name == ipstr) {
+          ipstr.clone()
+        } else {
+          interfaces
+            .iter()
+            .find(|iface| iface.ipv4.iter().any(|ip| ip.addr().to_string() == *ipstr))
+            .map(|iface| iface.name.clone())
+            .unwrap_or_else(|| {
+              panic!("BIND_IP {} did not match any interface name or IP address", ipstr)
+            })
+        }
+      })
+      .unwrap_or_else(|| {
+        netdev::get_interfaces()
+          .iter()
+          .find(|iface| iface.ipv4.iter().any(|ip| ip.addr() == self_info.ip_address))
+          .map(|iface| iface.name.clone())
+          .expect("Cannot find interface for local IP")
+      });
+
     let use_safe_clock = config
       .get("USE_SAFE_CLOCK")
       .map(|s| s.parse().expect("invalid USE_SAFE_CLOCK, must be boolean"))
@@ -194,6 +219,7 @@ impl Settings {
 
     let mut result = Self {
       self_info,
+      bind_iface,
       tx_latency_ns: config
         .get("TX_LATENCY_NS")
         .map(|p| p.parse().expect("invalid TX_LATENCY_NS, must be integer"))

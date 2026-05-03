@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 use tokio::sync::{broadcast as broadcast_queue, mpsc, watch, Mutex};
 
 use crate::common::*;
@@ -33,6 +34,7 @@ pub(crate) mod mdns_server;
 pub(crate) mod channels_subscriber;
 pub(crate) mod flows_rx;
 pub(crate) mod flows_tx;
+pub(crate) mod interface_monitor;
 mod peaks;
 pub(crate) mod samples_collector;
 pub(crate) mod samples_utils;
@@ -108,6 +110,14 @@ impl DeviceServer {
     info!("waiting for clock");
     let shared_media_clock = make_shared_media_clock(&clock_receiver, settings.use_safe_clock).await;
     info!("clock ready");
+
+    let (iface_tx, _) = broadcast::channel(16);
+    let iface_name = settings.bind_iface.clone();
+    let shdn_recv_iface = shutdown_send.subscribe();
+    tokio::spawn(async move {
+        let mut monitor = interface_monitor::InterfaceMonitor::new(&iface_name);
+        monitor.run(iface_tx).await;
+    });
 
     let mut tasks = vec![];
 
