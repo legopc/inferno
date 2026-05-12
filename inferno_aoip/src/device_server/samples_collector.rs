@@ -22,10 +22,12 @@ use tokio::{
 // samples to avoid gaps. E.g. at 2 ms and 48000 Hz: min LEAD = 96 samples.
 // NOTE: In event-driven mode (data_notify wired) this interval is only a safety-net fallback.
 // Normally samples_collector wakes within <0.5 ms of packet arrival via TransferNotifier.
-const FALLBACK_INTERVAL: Duration = Duration::from_millis(10);
+const FALLBACK_INTERVAL: Duration = Duration::from_millis(1);
+const CALLBACK_BLOCK_SIZE: usize = 32;
+const MAX_CALLBACK_BLOCKS_PER_WAKE: usize = 8;
 const BUFFER_SIZE: usize = 65536;
 const SANE_CLOCK_DIFF: usize = 192000;
-const MAX_LAG_SAMPLES: Clock = 9600;
+const ZERO_FILL_WARN_PERIODS: usize = 1000;
 
 pub type SamplesCallback = Box<dyn FnMut(usize, &Vec<Vec<Sample>>) + Send + 'static>;
 
@@ -35,6 +37,8 @@ struct Channel<P: ProxyToSamplesBuffer> {
   prev_holes_count: usize,
   latency_samples: Clock,
   was_connected: bool,
+  callback_cursor: Option<Clock>,
+  callback_zero_fills: usize,
 }
 
 impl<P: ProxyToSamplesBuffer> Channel<P> {
@@ -92,6 +96,57 @@ impl<P: ProxyToSamplesBuffer> Channel<P> {
       );
     }
     good
+  }
+
+  fn read_callback_block(&mut self, block_size: usize, buffer: &mut [Sample]) {
+    let buffer = &mut buffer[..block_size];
+    let readable_until = self.source.readable_until();
+    let Some(mut cursor) = self.callback_cursor else {
+      self.callback_cursor = Some(readable_until);
+      self.fill_callback_zeros(buffer, "bootstrap");
+      return;
+    };
+
+    let available = wrapped_diff(readable_until, cursor);
+    if available <= 0 {
+      self.fill_callback_zeros(buffer, "waiting for samples");
+      return;
+    }
+
+    if available > SANE_CLOCK_DIFF as ClockDiff {
+      warn!(
+        "callback channel id {} lagged by {available} samples; resyncing to latest block",
+        self.id
+      );
+      cursor = readable_until.wrapping_sub(block_size as Clock);
+      self.callback_cursor = Some(cursor);
+      self.read_samples_from_ringbuffer(cursor, buffer);
+      self.callback_cursor = Some(cursor.wrapping_add(block_size as Clock));
+      self.callback_zero_fills = 0;
+      return;
+    }
+
+    let available: usize = available.try_into().unwrap();
+
+    if available < block_size {
+      self.fill_callback_zeros(buffer, "partial callback block");
+      return;
+    }
+
+    self.read_samples_from_ringbuffer(cursor, buffer);
+    self.callback_cursor = Some(cursor.wrapping_add(block_size as Clock));
+    self.callback_zero_fills = 0;
+  }
+
+  fn fill_callback_zeros(&mut self, buffer: &mut [Sample], reason: &str) {
+    buffer.fill(0);
+    self.callback_zero_fills = self.callback_zero_fills.saturating_add(1);
+    if self.callback_zero_fills == ZERO_FILL_WARN_PERIODS || self.callback_zero_fills % (ZERO_FILL_WARN_PERIODS * 10) == 0 {
+      warn!(
+        "callback channel id {} has filled {} blocks with silence ({reason})",
+        self.id, self.callback_zero_fills
+      );
+    }
   }
 }
 
@@ -187,6 +242,8 @@ impl<P: ProxyToSamplesBuffer> ToRealTime<P> {
           prev_holes_count: 0,
           latency_samples: latency_samples.try_into().unwrap(),
           was_connected: false,
+          callback_cursor: None,
+          callback_zero_fills: 0,
         })));
       }
       Command::DisconnectChannel { channel_index } => {
@@ -228,10 +285,10 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
     get_min_max_end_timestamps(&self.channels)
   }
   async fn run(&mut self) {
-    let mut clock = None;
     let mut fallback_interval = interval(FALLBACK_INTERVAL);
     fallback_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut channels_buffers = (0..self.channels.len()).map(|_| vec![0; BUFFER_SIZE]).collect_vec();
+    let block_size = CALLBACK_BLOCK_SIZE.min(BUFFER_SIZE);
     'outer: loop {
       tokio::select! {
         biased;
@@ -241,77 +298,50 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
           }
           continue 'outer;
         }
-        _ = self.data_notify.notified() => {}
-        _ = fallback_interval.tick() => {}
+        _ = self.data_notify.notified() => {},
+        _ = fallback_interval.tick() => {},
+      };
+      if !self.has_callback_block_ready(block_size) {
+        continue;
       }
-      if let Some((min_end_ts, max_end_ts)) = self.get_min_max_end_timestamps() {
-            // lag prevention logic to prevent abruptly disconnected transmitters from causing buffer overrun
-            // in other audio channels
-            let lag = max_end_ts.wrapping_sub(min_end_ts);
-            let readable_until = if lag > MAX_LAG_SAMPLES {
-              max_end_ts.wrapping_sub(MAX_LAG_SAMPLES)
-            } else {
-              min_end_ts
-            };
 
-            let new_clock = {
-              if let Some(mut start_timestamp) = clock {
-                // we already have clock, use it as a start timestamp
-
-                let mut readable_samples_count = readable_until.wrapping_sub(start_timestamp).try_into().unwrap();
-                if readable_samples_count == 0 {
-                  warn!("no new samples?!");
-                } else {
-                  //debug!("we have {readable_samples_count} new samples");
-                }
-                if readable_samples_count > SANE_CLOCK_DIFF {
-                  error!("insane clock diff {readable_samples_count}, using {SANE_CLOCK_DIFF} last samples");
-                  readable_samples_count = SANE_CLOCK_DIFF;
-                  start_timestamp = readable_until.wrapping_sub(readable_samples_count.try_into().unwrap());
-                }
-                if readable_samples_count > BUFFER_SIZE.try_into().unwrap() {
-                  readable_samples_count = BUFFER_SIZE.try_into().unwrap();
-                }
-                for chi in 0..self.channels.len() {
-                  let buffer = channels_buffers[chi].as_mut_slice();
-                  let ch_opt = {
-                    if let Some(ch) = &mut self.channels[chi] {
-                      // if ch.source.readable_until() changes from None to Some after get_*_timestamp() call,
-                      // or lag prevention logic triggers,
-                      // it would break our assumption that each channel has *at least* readable_samples_count readable.
-                      // that's why we need this check.
-                      // XXX FIXME wrapping
-                      if wrapped_diff(ch.source.readable_until(), readable_until) < 0 {
-                        None
-                      } else {
-                        Some(ch)
-                      }
-                    } else {
-                      None
-                    }
-                  };
-                  if let Some(ch) = ch_opt {
-                    ch.read_samples_from_ringbuffer(start_timestamp, &mut buffer[0..readable_samples_count]);
-                  } else {
-                    buffer[0..readable_samples_count].fill(0);
-                  }
-                }
-                (self.callback)(readable_samples_count, &channels_buffers);
-                start_timestamp.wrapping_add(readable_samples_count.try_into().unwrap())
-              } else {
-                // we don't have clock yet, bootstrap it using currently available timestamp
-                readable_until
-              }
-            };
-            for chi in 0..self.channels.len() {
-              if let Some(ch) = &mut self.channels[chi] {
-                ch.source.read_done(new_clock as usize); // TODO force buffer sizes to be power of 2
-              }
+      for _ in 0..MAX_CALLBACK_BLOCKS_PER_WAKE {
+        if !self.has_callback_block_ready(block_size) {
+          break;
+        }
+        for chi in 0..self.channels.len() {
+          let buffer = channels_buffers[chi].as_mut_slice();
+          if let Some(ch) = &mut self.channels[chi] {
+            ch.read_callback_block(block_size, buffer);
+            if let Some(cursor) = ch.callback_cursor {
+              ch.source.read_done(cursor as usize); // TODO force buffer sizes to be power of 2
             }
-            clock = Some(new_clock);
+          } else {
+            buffer[0..block_size].fill(0);
           }
+        }
+        (self.callback)(block_size, &channels_buffers);
+      }
     }
   }
+
+  fn has_callback_block_ready(&mut self, block_size: usize) -> bool {
+    for ch in self.channels.iter_mut().filter_map(|ch| ch.as_mut()) {
+      let readable_until = ch.source.readable_until();
+      let Some(cursor) = ch.callback_cursor else {
+        ch.callback_cursor = Some(readable_until);
+        continue;
+      };
+      let available = wrapped_diff(readable_until, cursor);
+      if available > 0 && available as usize >= block_size {
+        return true;
+      } else if available > SANE_CLOCK_DIFF as isize {
+        return true;
+      }
+    }
+    false
+  }
+
   async fn handle_command(&mut self, command_opt: Option<Command<P>>) -> bool {
     let command = command_opt.unwrap_or(Command::Shutdown);
     match command {
@@ -323,6 +353,8 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
           prev_holes_count: 0,
           latency_samples: latency_samples.try_into().unwrap(),
           was_connected: false,
+          callback_cursor: None,
+          callback_zero_fills: 0,
         });
       }
       Command::DisconnectChannel { channel_index } => {
@@ -396,5 +428,65 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static> SamplesCollector<P> {
   }
   pub async fn shutdown(&self) {
     self.commands_sender.send(Command::Shutdown).await.log_and_forget();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::ring_buffer::new_owned;
+
+  fn channel_at(start_time: Clock) -> (crate::ring_buffer::RBInput<Sample, crate::ring_buffer::OwnedBuffer<atomic::Atomic<Sample>>>, Channel<crate::ring_buffer::OwnedBuffer<atomic::Atomic<Sample>>>) {
+    let (input, output) = new_owned(256, start_time, 4);
+    (
+      input,
+      Channel {
+        id: 1,
+        source: output,
+        prev_holes_count: 0,
+        latency_samples: 0,
+        was_connected: false,
+        callback_cursor: None,
+        callback_zero_fills: 0,
+      },
+    )
+  }
+
+  #[test]
+  fn callback_channels_read_independent_timestamp_epochs() {
+    let (mut input_a, mut channel_a) = channel_at(1_000);
+    let (mut input_b, mut channel_b) = channel_at(1_000_000);
+    let mut out_a = vec![0; CALLBACK_BLOCK_SIZE];
+    let mut out_b = vec![0; CALLBACK_BLOCK_SIZE];
+
+    input_a.write_from_at(1_000, (0..CALLBACK_BLOCK_SIZE).map(|i| 100 + i as Sample));
+    input_b.write_from_at(1_000_000, (0..CALLBACK_BLOCK_SIZE).map(|i| 200 + i as Sample));
+
+    channel_a.callback_cursor = Some(1_000);
+    channel_b.callback_cursor = Some(1_000_000);
+
+    channel_a.read_callback_block(CALLBACK_BLOCK_SIZE, &mut out_a);
+    channel_b.read_callback_block(CALLBACK_BLOCK_SIZE, &mut out_b);
+
+    assert_eq!(out_a, (0..CALLBACK_BLOCK_SIZE).map(|i| 100 + i as Sample).collect::<Vec<_>>());
+    assert_eq!(out_b, (0..CALLBACK_BLOCK_SIZE).map(|i| 200 + i as Sample).collect::<Vec<_>>());
+    assert_eq!(channel_a.callback_cursor, Some(1_000 + CALLBACK_BLOCK_SIZE as Clock));
+    assert_eq!(channel_b.callback_cursor, Some(1_000_000 + CALLBACK_BLOCK_SIZE as Clock));
+  }
+
+  #[test]
+  fn callback_channel_resyncs_when_cursor_falls_too_far_behind() {
+    let start_time = 1_000;
+    let mut values = vec![0; CALLBACK_BLOCK_SIZE];
+    let (mut input, mut channel) = channel_at(start_time);
+    let latest_block_start = start_time + SANE_CLOCK_DIFF as Clock + 64;
+
+    input.write_from_at(latest_block_start, (0..CALLBACK_BLOCK_SIZE).map(|i| 300 + i as Sample));
+    channel.callback_cursor = Some(start_time);
+
+    channel.read_callback_block(CALLBACK_BLOCK_SIZE, &mut values);
+
+    assert_eq!(values, (0..CALLBACK_BLOCK_SIZE).map(|i| 300 + i as Sample).collect::<Vec<_>>());
+    assert_eq!(channel.callback_cursor, Some(latest_block_start + CALLBACK_BLOCK_SIZE as Clock));
   }
 }

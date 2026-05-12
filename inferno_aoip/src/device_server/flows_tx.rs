@@ -45,6 +45,7 @@ pub const MIN_SLEEP: Duration = Duration::from_millis(0); // to save CPU cycles,
 
 // it's better to have the clock in the past than in the future - otherwise Dante devices receiving from us go mad and fart
 const CLOCK_OFFSET_NS: ClockDiff = -500_000;
+const TX_TIMESTAMP_OFFSET_SAMPLES_ENV: &str = "INFERNO_TX_TIMESTAMP_OFFSET_SAMPLES";
 
 pub type SamplesRequestCallback = Box<dyn FnMut(Clock, usize, &mut [Sample]) + Send + 'static>;
 
@@ -105,6 +106,7 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   send_latency_samples: usize,
   clock_offset_samples: LongClockDiff,
   max_lag_samples: usize,
+  timestamp_header_offset_samples: LongClockDiff,
   timestamp_shift: ClockDiff,
   current_timestamp: Arc<AtomicUsize>,
   on_transfer: Option<TransferNotifier>,
@@ -146,7 +148,11 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       pbuff[9..9 + stride * flow.fpp].fill(0);
       while wrapped_diff(now as Clock, flow.next_ts as Clock) >= 0 {
         pbuff[0] = 2u8; // ???
-        let packet_ts = flow.next_ts.wrapping_add_signed(self.clock_offset_samples) /* .wrapping_sub(flow.fpp) */; // ???
+        let packet_ts = tx_packet_timestamp(
+          flow.next_ts,
+          self.clock_offset_samples,
+          self.timestamp_header_offset_samples,
+        ) /* .wrapping_sub(flow.fpp) */; // ???
         let seconds = packet_ts / (sample_rate as LongClock);
         let subsec_samples = packet_ts % (sample_rate as LongClock);
         pbuff[1..5].copy_from_slice(&(seconds as u32).to_be_bytes());
@@ -576,6 +582,7 @@ impl FlowsTransmitter {
       clock_offset_samples: (CLOCK_OFFSET_NS as i64 * sample_rate as i64 / 1_000_000_000i64)
         .try_into()
         .unwrap(),
+      timestamp_header_offset_samples: tx_timestamp_offset_samples_from_env(),
       current_timestamp,
       on_transfer,
       tx_bytes,
@@ -839,5 +846,56 @@ impl FlowsTransmitter {
   }
   pub fn get_flows_info(&self) -> &Vec<Option<FlowInfo>> {
     &self.flows_info
+  }
+}
+
+fn tx_packet_timestamp(
+  next_ts: LongClock,
+  clock_offset_samples: LongClockDiff,
+  timestamp_header_offset_samples: LongClockDiff,
+) -> LongClock {
+  next_ts.wrapping_add_signed(clock_offset_samples).wrapping_add_signed(timestamp_header_offset_samples)
+}
+
+fn parse_tx_timestamp_offset_samples(value: Option<String>) -> LongClockDiff {
+  value
+    .and_then(|v| match v.parse::<LongClockDiff>() {
+      Ok(offset) => Some(offset),
+      Err(e) => {
+        warn!("Ignoring invalid {TX_TIMESTAMP_OFFSET_SAMPLES_ENV}={v:?}: {e}");
+        None
+      }
+    })
+    .unwrap_or(0)
+}
+
+fn tx_timestamp_offset_samples_from_env() -> LongClockDiff {
+  parse_tx_timestamp_offset_samples(std::env::var(TX_TIMESTAMP_OFFSET_SAMPLES_ENV).ok())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn tx_packet_timestamp_applies_clock_and_header_offsets() {
+    assert_eq!(tx_packet_timestamp(1_000, -24, 500), 1_476);
+  }
+
+  #[test]
+  fn tx_packet_timestamp_wraps_offsets() {
+    assert_eq!(tx_packet_timestamp(5, -10, 2), LongClock::MAX - 2);
+  }
+
+  #[test]
+  fn tx_timestamp_offset_parser_accepts_valid_values() {
+    assert_eq!(parse_tx_timestamp_offset_samples(Some("5030091880".to_string())), 5_030_091_880);
+    assert_eq!(parse_tx_timestamp_offset_samples(Some("-48000".to_string())), -48_000);
+  }
+
+  #[test]
+  fn tx_timestamp_offset_parser_defaults_invalid_or_missing_values_to_zero() {
+    assert_eq!(parse_tx_timestamp_offset_samples(None), 0);
+    assert_eq!(parse_tx_timestamp_offset_samples(Some("not-a-number".to_string())), 0);
   }
 }
